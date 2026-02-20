@@ -187,7 +187,60 @@ def take_screenshot():
     if not HAS_PILLOW:
         emit_error("Pillow is required on Windows for screenshot capture.")
         return None
+    pictures_dir = Path.home() / "Pictures" / "ocr"
+    pictures_dir.mkdir(parents=True, exist_ok=True)
 
+    # First attempt: use Windows Snipping Tool / screenclip and grab image from clipboard
+    try:
+        emit_info("Attempting to use Windows Snipping Tool (press Win+Shift+S to snip)...")
+        try:
+            subprocess.Popen(["explorer", "ms-screenclip:"])
+        except Exception:
+            try:
+                subprocess.Popen(["SnippingTool.exe"])
+            except Exception:
+                pass
+
+        import time
+        img = None
+        timeout_seconds = 10
+        poll_interval = 0.1
+        for _ in range(int(timeout_seconds / poll_interval)):
+            try:
+                img = ImageGrab.grabclipboard()
+            except Exception:
+                img = None
+            if img:
+                break
+            time.sleep(poll_interval)
+
+        if img:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = pictures_dir / f"Screenshot_{timestamp}.png"
+            try:
+                # If image is a PIL Image
+                if hasattr(img, "save"):
+                    img.save(filename)
+                # On some systems grabclipboard may return a list of file paths
+                elif isinstance(img, (list, tuple)) and img and isinstance(img[0], str):
+                    shutil.copy(img[0], filename)
+                else:
+                    # Fallback: take full screen grab
+                    fallback = ImageGrab.grab()
+                    fallback.save(filename)
+            except Exception as e:
+                log_error("Saving Snip Failed", str(e))
+                emit_warning("Failed to save snip from clipboard. Falling back to region selector.")
+            else:
+                emit_info(f"Screenshot saved: {filename}")
+                return filename
+        else:
+            emit_warning("No image found on clipboard after snip. Falling back to region selector.")
+    except Exception as e:
+        log_error("Snipping Tool Error", str(e))
+        emit_warning("Snipping attempt failed. Falling back to region selector.")
+
+    # Fallback: in-app region selector using tkinter
     emit_info("Please select region on screen...")
     bbox = select_region()
     if not bbox:
@@ -202,11 +255,14 @@ def take_screenshot():
         emit_error(f"Failed to capture screenshot: {e}")
         return None
 
-    pictures_dir = Path.home() / "Pictures" / "ocr"
-    pictures_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = pictures_dir / f"Screenshot_{timestamp}.png"
-    cropped.save(filename)
+    try:
+        cropped.save(filename)
+    except Exception as e:
+        log_error("Save Cropped Failed", str(e))
+        emit_error(f"Failed to save cropped screenshot: {e}")
+        return None
     return filename
 
 
