@@ -108,6 +108,63 @@ python ocr_only_windows.py table
 python ocr_only_windows.py figure
 ```
 
+## Run GUI from an app launcher / shortcut
+
+Yes, you can launch the GUI from a registered app entry on Fedora and from a shortcut on Windows.
+
+### Fedora (GNOME/KDE app menu)
+
+Create a desktop entry:
+
+```bash
+cat > ~/.local/share/applications/glm-ocr.desktop <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=GLM OCR
+Comment=Launch OCR GUI
+Exec=python3 /ABSOLUTE/PATH/TO/ocr_cleaner/ocr_gui.py
+Path=/ABSOLUTE/PATH/TO/ocr_cleaner
+Terminal=false
+Categories=Utility;
+StartupNotify=true
+EOF
+```
+
+Replace `/ABSOLUTE/PATH/TO/ocr_cleaner` with your real project path.
+
+Optional (some desktops require executable bit):
+
+```bash
+chmod +x ~/.local/share/applications/glm-ocr.desktop
+```
+
+Then open your app menu and search for `GLM OCR` (or run `gtk-launch glm-ocr`).
+
+### Windows (Desktop or Start Menu shortcut)
+
+Use a real `.lnk` shortcut (not a `.bat`) and set icon explicitly.
+
+From PowerShell:
+
+```powershell
+$Project = "C:\path\to\ocr_cleaner"
+$Pythonw = (Get-Command pythonw.exe).Source
+$WshShell = New-Object -ComObject WScript.Shell
+$Shortcut = $WshShell.CreateShortcut("$env:USERPROFILE\Desktop\GLM OCR.lnk")
+$Shortcut.TargetPath = $Pythonw
+$Shortcut.Arguments = "`"$Project\ocr_gui_windows.py`""
+$Shortcut.WorkingDirectory = $Project
+$Shortcut.IconLocation = "$Project\assets\glm_ocr.ico,0"
+$Shortcut.Save()
+```
+
+Then:
+- Right click `GLM OCR.lnk` -> `Pin to taskbar`.
+- If you pinned an older shortcut before, unpin it first and pin this new one.
+- `assets/glm_ocr.ico` is included in this repo and used by the app + shortcut.
+
+You can rename the shortcut to `GLM OCR` and pin it to Start/Taskbar.
+
 ## Typical flow
 
 1. Start GUI.

@@ -1,9 +1,33 @@
 #!/usr/bin/env python3
 import sys
+import ctypes
 from pathlib import Path
 from PyQt6.QtCore import QSize, QProcess, Qt
-from PyQt6.QtGui import QFont, QIcon
+from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import QApplication, QLabel, QPushButton, QTextEdit, QVBoxLayout, QWidget
+
+
+def build_app_icon():
+    icon_file = Path(__file__).parent / "assets" / "glm_ocr.ico"
+    if icon_file.exists():
+        return QIcon(str(icon_file))
+
+    pixmap = QPixmap(128, 128)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor("#0b3d91"))
+    painter.drawRoundedRect(8, 8, 112, 112, 20, 20)
+
+    painter.setPen(QPen(QColor("#ffffff"), 8))
+    painter.drawLine(30, 88, 58, 56)
+    painter.drawLine(58, 56, 72, 70)
+    painter.drawLine(72, 70, 98, 40)
+
+    painter.end()
+    return QIcon(pixmap)
 
 
 class OCRLauncherWindows(QWidget):
@@ -25,6 +49,7 @@ class OCRLauncherWindows(QWidget):
 
     def init_ui(self):
         self.setWindowTitle("GLM-OCR Interface (Windows)")
+        self.setWindowIcon(build_app_icon())
         self.setFixedSize(360, 390)
 
         layout = QVBoxLayout()
@@ -136,7 +161,13 @@ class OCRLauncherWindows(QWidget):
 
 
 def main():
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("sorins.glmocr.app")
+    except Exception:
+        pass
+
     app = QApplication(sys.argv)
+    app.setWindowIcon(build_app_icon())
     window = OCRLauncherWindows()
     window.show()
     sys.exit(app.exec())

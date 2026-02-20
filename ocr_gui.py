@@ -5,7 +5,30 @@ from pathlib import Path
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QPushButton, 
                              QLabel, QTextEdit)
 from PyQt6.QtCore import Qt, QProcess, QSize
-from PyQt6.QtGui import QIcon, QFont
+from PyQt6.QtGui import QIcon, QFont, QColor, QPainter, QPen, QPixmap
+
+
+def build_app_icon():
+    icon_file = Path(__file__).parent / "assets" / "glm_ocr.ico"
+    if icon_file.exists():
+        return QIcon(str(icon_file))
+
+    pixmap = QPixmap(128, 128)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor("#0b3d91"))
+    painter.drawRoundedRect(8, 8, 112, 112, 20, 20)
+
+    painter.setPen(QPen(QColor("#ffffff"), 8))
+    painter.drawLine(30, 88, 58, 56)
+    painter.drawLine(58, 56, 72, 70)
+    painter.drawLine(72, 70, 98, 40)
+
+    painter.end()
+    return QIcon(pixmap)
 
 class OCRLauncher(QWidget):
     def __init__(self):
@@ -30,6 +53,7 @@ class OCRLauncher(QWidget):
 
     def initUI(self):
         self.setWindowTitle("GLM-OCR Interface")
+        self.setWindowIcon(build_app_icon())
         self.setFixedSize(320, 350) # Slightly taller for the log
 
         layout = QVBoxLayout()
@@ -160,6 +184,7 @@ class OCRLauncher(QWidget):
 
 def main():
     app = QApplication(sys.argv)
+    app.setWindowIcon(build_app_icon())
     app.setDesktopFileName("glm-ocr")
     
     window = OCRLauncher()
