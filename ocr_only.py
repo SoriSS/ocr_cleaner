@@ -13,6 +13,7 @@ CLIPBOARD_CMD = 'wl-copy'
 DEBUG_LOG = Path.home() / "ocr_debug.log"
 EDITOR_CMD = 'kwrite'  # The text editor to open
 OLLAMA_TIMEOUT_SECONDS = 180
+MODEL_NAME = "glm-ocr"
 TABLE_STYLE_BLOCK = """<style>
 table {
   width: auto;
@@ -211,7 +212,7 @@ def check_ollama_model():
     """Fast preflight so we fail clearly before long OCR execution."""
     try:
         result = subprocess.run(
-            ["ollama", "show", "glm-ocr"],
+            ["ollama", "show", MODEL_NAME],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -219,7 +220,7 @@ def check_ollama_model():
         )
         if result.returncode != 0:
             err = (result.stderr or "").strip()
-            emit_error("Model 'glm-ocr' is not ready in Ollama.")
+            emit_error(f"Model '{MODEL_NAME}' is not ready in Ollama.")
             if err:
                 emit_error(err)
             return False
@@ -237,7 +238,7 @@ def run_ollama(prompt):
     Returns (returncode, stdout, stderr, timed_out).
     """
     process = subprocess.Popen(
-        ["ollama", "run", "glm-ocr"],
+        ["ollama", "run", MODEL_NAME],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -260,6 +261,55 @@ def run_ollama(prompt):
             process.kill()
             stdout, stderr = process.communicate()
         return 124, stdout or "", stderr or "", True
+
+def detect_model_processor():
+    """
+    Best-effort check for the loaded model processor from `ollama ps`.
+    Returns "GPU", "CPU", "UNKNOWN", or None if not available.
+    """
+    try:
+        result = subprocess.run(
+            ["ollama", "ps"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=8,
+        )
+    except Exception:
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.lower().startswith("name"):
+            continue
+        if MODEL_NAME not in stripped:
+            continue
+        upper = stripped.upper()
+        if "GPU" in upper:
+            return "GPU"
+        if "CPU" in upper:
+            return "CPU"
+        return "UNKNOWN"
+    return None
+
+def emit_processor_diagnostics():
+    processor = detect_model_processor()
+    if processor == "GPU":
+        emit_info("Ollama processor: GPU")
+        return
+    if processor == "CPU":
+        emit_warning("Ollama processor: CPU (slow).")
+        emit_warning("Fedora fix: restart daemon and re-check with `ollama ps`.")
+        emit_warning("Try: `pkill -f \"ollama serve\" && ollama serve`")
+        emit_warning("If still CPU, verify GPU drivers/toolkit after the Fedora update.")
+        return
+    if processor == "UNKNOWN":
+        emit_warning("Ollama processor is active but could not be parsed from `ollama ps`.")
+        return
+    emit_warning("Could not read `ollama ps` processor status.")
 
 def apply_table_styling(mode, output_text):
     if mode != "Table Recognition":
@@ -297,7 +347,7 @@ def run():
         return 1
 
     emit_info(f"Screenshot saved: {original_path}")
-    emit_info("Running glm-ocr...")
+    emit_info(f"Running {MODEL_NAME}...")
 
     # 2. Sanitize
     processing_path = sanitize_image(original_path)
@@ -319,6 +369,7 @@ def run():
 
         emit_info(f"Waiting for OCR result (timeout: {OLLAMA_TIMEOUT_SECONDS}s)...")
         return_code, stdout, stderr, timed_out = run_ollama(prompt)
+        emit_processor_diagnostics()
 
         # Cleanup temp file
         if processing_path != original_path and processing_path.exists():

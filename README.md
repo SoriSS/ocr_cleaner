@@ -181,6 +181,10 @@ You can rename the shortcut to `GLM OCR` and pin it to Start/Taskbar.
 - Stuck at OCR step:
   - ensure daemon is up: `ollama ps`
   - ensure model exists: `ollama show glm-ocr`
+- OCR is unexpectedly slow / CPU-only after Fedora update:
+  - check processor column: `ollama ps` (look for `GPU` vs `CPU`)
+  - restart daemon: `pkill -f "ollama serve" && ollama serve`
+  - if still CPU, reinstall/repair your GPU driver stack after the OS update.
 - No screenshot:
   - ensure `spectacle` is installed and region selection is not canceled.
 - No clipboard output:
