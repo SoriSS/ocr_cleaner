@@ -11,6 +11,32 @@ from pathlib import Path
 DEBUG_LOG = Path.home() / "ocr_debug.log"
 EDITOR_CMD = "notepad.exe"
 OLLAMA_TIMEOUT_SECONDS = 180
+TABLE_STYLE_BLOCK = """<style>
+table {
+  width: auto;
+  max-width: 100%;
+  display: inline-table;
+  border-collapse: collapse;
+  font-family: sans-serif;
+  font-size: 14px;
+}
+
+th, td {
+  padding: 8px 10px;
+  border: 1px solid #ddd;
+  text-align: left;
+  vertical-align: top;
+  max-width: 48ch;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+th {
+  background: #f5f5f5;
+  font-weight: 600;
+}
+</style>
+"""
 
 try:
     from PIL import Image, ImageGrab
@@ -294,6 +320,32 @@ def run_ollama(prompt):
         return 124, stdout or "", stderr or "", True
 
 
+def apply_table_styling(mode, output_text):
+    if mode != "Table Recognition":
+        return output_text
+
+    lower_output = output_text.lower()
+    if "<table" not in lower_output:
+        return output_text
+
+    styled_output = re.sub(
+        r"<table(\s[^>]*)?>",
+        r'<div style="overflow-x:auto;"><table\1>',
+        output_text,
+        flags=re.IGNORECASE,
+    )
+    styled_output = re.sub(
+        r"</table>",
+        "</table></div>",
+        styled_output,
+        flags=re.IGNORECASE,
+    )
+
+    if "<style" in lower_output:
+        return styled_output
+    return f"{TABLE_STYLE_BLOCK}\n{styled_output}"
+
+
 def run():
     mode = get_mode()
     emit_info(f"Mode: {mode}")
@@ -340,6 +392,7 @@ def run():
 
         raw_output = stdout
         clean_output = re.sub(r"Added image '.*?'", "", raw_output).strip()
+        clean_output = apply_table_styling(mode, clean_output)
         if not clean_output:
             emit_warning("Model returned no text.")
             return 3
