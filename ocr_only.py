@@ -50,11 +50,15 @@ except ImportError:
 
 def log_error(message, error_details=""):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(DEBUG_LOG, "a") as f:
-        f.write(f"[{timestamp}] {message}\n")
-        if error_details:
-            f.write(f"DETAILS:\n{error_details}\n")
-        f.write("-" * 40 + "\n")
+    try:
+        with open(DEBUG_LOG, "a") as f:
+            f.write(f"[{timestamp}] {message}\n")
+            if error_details:
+                f.write(f"DETAILS:\n{error_details}\n")
+            f.write("-" * 40 + "\n")
+    except Exception:
+        # Logging must never interrupt OCR execution.
+        pass
 
 def emit_info(message):
     print(f"[INFO] {message}", flush=True)
@@ -133,24 +137,81 @@ def sanitize_image(image_path):
         emit_warning("Image sanitization failed. Using original screenshot.")
         return image_path
 
+def _run_capture_command(cmd, filename, backend_name):
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+    except Exception as e:
+        log_error(f"{backend_name} screenshot exception", str(e))
+        emit_warning(f"{backend_name} screenshot failed: {e}")
+        return False
+
+    stderr = (result.stderr or "").strip()
+    stdout = (result.stdout or "").strip()
+
+    if filename.exists() and filename.stat().st_size > 0:
+        if result.returncode != 0:
+            emit_warning(
+                f"{backend_name} returned {result.returncode}, but screenshot file was created."
+            )
+        return True
+
+    if result.returncode != 0:
+        details = stderr or stdout or "no stderr/stdout"
+        log_error(
+            f"{backend_name} screenshot failed (exit {result.returncode})",
+            details,
+        )
+        emit_warning(f"{backend_name} failed (exit {result.returncode}).")
+        if stderr:
+            emit_warning(stderr.splitlines()[-1])
+        return False
+
+    log_error(f"{backend_name} screenshot produced no file", "empty output")
+    emit_warning(f"{backend_name} finished but no screenshot file was created.")
+    return False
+
 def take_screenshot():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     pictures_dir = Path.home() / "Pictures" / "ocr"
     pictures_dir.mkdir(parents=True, exist_ok=True)
     filename = pictures_dir / f"Screenshot_{timestamp}.png"
-    
-    cmd = ["spectacle", "-r", "-b", "-n", "-o", str(filename)]
 
     try:
-        if not shutil.which("spectacle"):
-            emit_error("Missing dependency: spectacle")
+        backends = []
+
+        if shutil.which("spectacle"):
+            backends.append(
+                ("spectacle", ["spectacle", "-r", "-b", "-n", "-o", str(filename)])
+            )
+            backends.append(
+                ("spectacle (legacy flags)", ["spectacle", "-r", "-b", "-o", str(filename)])
+            )
+
+        if shutil.which("gnome-screenshot"):
+            backends.append(
+                ("gnome-screenshot", ["gnome-screenshot", "-a", "-f", str(filename)])
+            )
+
+        if not backends:
+            emit_error("Missing screenshot dependency: install spectacle or gnome-screenshot")
             return None
-        subprocess.run(cmd, check=True, stderr=subprocess.PIPE)
-        if filename.exists():
-            return filename
-        return None
-    except subprocess.CalledProcessError:
+
+        for backend_name, cmd in backends:
+            if filename.exists():
+                filename.unlink(missing_ok=True)
+            if _run_capture_command(cmd, filename, backend_name):
+                return filename
+
         emit_warning("Screenshot canceled or failed.")
+        return None
+    except Exception as e:
+        log_error("Screenshot Error", str(e))
+        emit_warning(f"Screenshot failed: {e}")
         return None
 
 def get_mode():
@@ -344,7 +405,7 @@ def run():
     original_path = take_screenshot()
     if not original_path:
         emit_warning("No screenshot captured. OCR aborted.")
-        return 1
+        return 0
 
     emit_info(f"Screenshot saved: {original_path}")
     emit_info(f"Running {MODEL_NAME}...")

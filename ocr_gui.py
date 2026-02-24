@@ -35,6 +35,7 @@ class OCRLauncher(QWidget):
         super().__init__()
         self.script_path = self.find_backend_script()
         self.process = None # Keep reference to prevent garbage collection
+        self.no_capture_abort = False
         self.initUI()
 
     def find_backend_script(self):
@@ -135,6 +136,7 @@ class OCRLauncher(QWidget):
 
         # 1. Lock UI
         self.set_buttons_enabled(False)
+        self.no_capture_abort = False
         self.log(f"[INFO] Starting {mode}...")
         self.log("[INFO] Please select region on screen...")
 
@@ -158,6 +160,8 @@ class OCRLauncher(QWidget):
         for line in stdout.splitlines():
             line = line.strip()
             if line:
+                if "No screenshot captured" in line:
+                    self.no_capture_abort = True
                 self.log(line)
 
     def handle_stderr(self):
@@ -174,6 +178,11 @@ class OCRLauncher(QWidget):
     def on_process_finished(self, exit_code, exit_status):
         self.set_buttons_enabled(True)
         if exit_code == 0:
+            self.log("[INFO] Backend process completed.")
+            return
+
+        if exit_code == 1 and self.no_capture_abort:
+            self.log("[INFO] Screenshot step was canceled.")
             self.log("[INFO] Backend process completed.")
             return
 
