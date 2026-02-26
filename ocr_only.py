@@ -7,10 +7,12 @@ import os
 import signal
 from pathlib import Path
 from datetime import datetime
+import tempfile
 
 # --- CONFIGURATION ---
 CLIPBOARD_CMD = 'wl-copy' 
 DEBUG_LOG = Path.home() / "ocr_debug.log"
+OUTPUT_FILE = Path.home() / "Pictures" / "ocr" / "ocr_result.txt"
 EDITOR_CMD = 'kwrite'  # The text editor to open
 OLLAMA_TIMEOUT_SECONDS = 180
 MODEL_NAME = "glm-ocr"
@@ -176,10 +178,9 @@ def _run_capture_command(cmd, filename, backend_name):
     return False
 
 def take_screenshot():
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    pictures_dir = Path.home() / "Pictures" / "ocr"
-    pictures_dir.mkdir(parents=True, exist_ok=True)
-    filename = pictures_dir / f"Screenshot_{timestamp}.png"
+    tmp = tempfile.NamedTemporaryFile(prefix="ocr_capture_", suffix=".png", delete=False)
+    filename = Path(tmp.name)
+    tmp.close()
 
     try:
         backends = []
@@ -199,6 +200,8 @@ def take_screenshot():
 
         if not backends:
             emit_error("Missing screenshot dependency: install spectacle or gnome-screenshot")
+            if filename.exists():
+                os.remove(filename)
             return None
 
         for backend_name, cmd in backends:
@@ -208,10 +211,14 @@ def take_screenshot():
                 return filename
 
         emit_warning("Screenshot canceled or failed.")
+        if filename.exists():
+            os.remove(filename)
         return None
     except Exception as e:
         log_error("Screenshot Error", str(e))
         emit_warning(f"Screenshot failed: {e}")
+        if filename.exists():
+            os.remove(filename)
         return None
 
 def get_mode():
@@ -407,7 +414,7 @@ def run():
         emit_warning("No screenshot captured. OCR aborted.")
         return 0
 
-    emit_info(f"Screenshot saved: {original_path}")
+    emit_info(f"Screenshot captured: {original_path}")
     emit_info(f"Running {MODEL_NAME}...")
 
     # 2. Sanitize
@@ -432,9 +439,6 @@ def run():
         return_code, stdout, stderr, timed_out = run_ollama(prompt)
         emit_processor_diagnostics()
 
-        # Cleanup temp file
-        if processing_path != original_path and processing_path.exists():
-            os.remove(processing_path)
 
         if return_code != 0:
             err_msg = (stderr or "").strip()
@@ -457,7 +461,7 @@ def run():
             return 3
 
         # 5. Save to File
-        output_file = original_path.with_suffix('.txt')
+        output_file = OUTPUT_FILE
         with open(output_file, 'w', encoding='utf-8') as f:
             f.write(clean_output)
         emit_info(f"Saved output file: {output_file}")
@@ -476,6 +480,17 @@ def run():
         emit_error(f"Unexpected error: {e}")
         emit_error("Check ~/ocr_debug.log")
         return 99
+    finally:
+        try:
+            if processing_path != original_path and processing_path.exists():
+                os.remove(processing_path)
+        except Exception:
+            pass
+        try:
+            if original_path.exists():
+                os.remove(original_path)
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     sys.exit(run())

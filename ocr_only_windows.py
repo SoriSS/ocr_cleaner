@@ -7,8 +7,10 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+import tempfile
 
 DEBUG_LOG = Path.home() / "ocr_debug.log"
+OUTPUT_FILE = Path.home() / "Pictures" / "ocr" / "ocr_result.txt"
 EDITOR_CMD = "notepad.exe"
 OLLAMA_TIMEOUT_SECONDS = 180
 TABLE_STYLE_BLOCK = """<style>
@@ -187,60 +189,7 @@ def take_screenshot():
     if not HAS_PILLOW:
         emit_error("Pillow is required on Windows for screenshot capture.")
         return None
-    pictures_dir = Path.home() / "Pictures" / "ocr"
-    pictures_dir.mkdir(parents=True, exist_ok=True)
 
-    # First attempt: use Windows Snipping Tool / screenclip and grab image from clipboard
-    try:
-        emit_info("Attempting to use Windows Snipping Tool (press Win+Shift+S to snip)...")
-        try:
-            subprocess.Popen(["explorer", "ms-screenclip:"])
-        except Exception:
-            try:
-                subprocess.Popen(["SnippingTool.exe"])
-            except Exception:
-                pass
-
-        import time
-        img = None
-        timeout_seconds = 10
-        poll_interval = 0.1
-        for _ in range(int(timeout_seconds / poll_interval)):
-            try:
-                img = ImageGrab.grabclipboard()
-            except Exception:
-                img = None
-            if img:
-                break
-            time.sleep(poll_interval)
-
-        if img:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = pictures_dir / f"Screenshot_{timestamp}.png"
-            try:
-                # If image is a PIL Image
-                if hasattr(img, "save"):
-                    img.save(filename)
-                # On some systems grabclipboard may return a list of file paths
-                elif isinstance(img, (list, tuple)) and img and isinstance(img[0], str):
-                    shutil.copy(img[0], filename)
-                else:
-                    # Fallback: take full screen grab
-                    fallback = ImageGrab.grab()
-                    fallback.save(filename)
-            except Exception as e:
-                log_error("Saving Snip Failed", str(e))
-                emit_warning("Failed to save snip from clipboard. Falling back to region selector.")
-            else:
-                emit_info(f"Screenshot saved: {filename}")
-                return filename
-        else:
-            emit_warning("No image found on clipboard after snip. Falling back to region selector.")
-    except Exception as e:
-        log_error("Snipping Tool Error", str(e))
-        emit_warning("Snipping attempt failed. Falling back to region selector.")
-
-    # Fallback: in-app region selector using tkinter
     emit_info("Please select region on screen...")
     bbox = select_region()
     if not bbox:
@@ -255,16 +204,11 @@ def take_screenshot():
         emit_error(f"Failed to capture screenshot: {e}")
         return None
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = pictures_dir / f"Screenshot_{timestamp}.png"
-    try:
-        cropped.save(filename)
-    except Exception as e:
-        log_error("Save Cropped Failed", str(e))
-        emit_error(f"Failed to save cropped screenshot: {e}")
-        return None
+    tmp = tempfile.NamedTemporaryFile(prefix="ocr_capture_", suffix=".png", delete=False)
+    filename = Path(tmp.name)
+    tmp.close()
+    cropped.save(filename)
     return filename
-
 
 def get_mode():
     if len(sys.argv) > 1:
@@ -411,7 +355,7 @@ def run():
         emit_warning("No screenshot captured. OCR aborted.")
         return 1
 
-    emit_info(f"Screenshot saved: {original_path}")
+    emit_info(f"Screenshot captured: {original_path}")
     emit_info("Running glm-ocr...")
 
     processing_path = sanitize_image(original_path)
@@ -432,8 +376,6 @@ def run():
         emit_info(f"Waiting for OCR result (timeout: {OLLAMA_TIMEOUT_SECONDS}s)...")
         return_code, stdout, stderr, timed_out = run_ollama(prompt)
 
-        if processing_path != original_path and processing_path.exists():
-            os.remove(processing_path)
 
         if return_code != 0:
             err_msg = (stderr or "").strip()
@@ -453,7 +395,7 @@ def run():
             emit_warning("Model returned no text.")
             return 3
 
-        output_file = original_path.with_suffix(".txt")
+        output_file = OUTPUT_FILE
         with open(output_file, "w", encoding="utf-8") as f:
             f.write(clean_output)
         emit_info(f"Saved output file: {output_file}")
@@ -468,6 +410,17 @@ def run():
         emit_error(f"Unexpected error: {e}")
         emit_error("Check ~/ocr_debug.log")
         return 99
+    finally:
+        try:
+            if processing_path != original_path and processing_path.exists():
+                os.remove(processing_path)
+        except Exception:
+            pass
+        try:
+            if original_path.exists():
+                os.remove(original_path)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
