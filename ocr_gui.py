@@ -36,6 +36,7 @@ class OCRLauncher(QWidget):
         self.script_path = self.find_backend_script()
         self.process = None # Keep reference to prevent garbage collection
         self.no_capture_abort = False
+        self.last_output_file = None
         self.initUI()
 
     def find_backend_script(self):
@@ -137,6 +138,7 @@ class OCRLauncher(QWidget):
         # 1. Lock UI
         self.set_buttons_enabled(False)
         self.no_capture_abort = False
+        self.last_output_file = None
         self.log(f"[INFO] Starting {mode}...")
         self.log("[INFO] Please select region on screen...")
 
@@ -162,6 +164,8 @@ class OCRLauncher(QWidget):
             if line:
                 if "No screenshot captured" in line:
                     self.no_capture_abort = True
+                if line.startswith("[INFO] Saved output file: "):
+                    self.last_output_file = line.split(": ", 1)[1].strip()
                 self.log(line)
 
     def handle_stderr(self):
@@ -178,6 +182,23 @@ class OCRLauncher(QWidget):
     def on_process_finished(self, exit_code, exit_status):
         self.set_buttons_enabled(True)
         if exit_code == 0:
+            if self.last_output_file:
+                try:
+                    output_path = Path(self.last_output_file)
+                    if output_path.exists():
+                        content = output_path.read_text(encoding="utf-8")
+                        if content.strip():
+                            preview = content[:1200]
+                            if len(content) > 1200:
+                                preview += "\n...[truncated preview]"
+                            self.log("[INFO] OCR preview:")
+                            self.log(preview)
+                        else:
+                            self.log("[WARNING] OCR output file is empty.")
+                    else:
+                        self.log(f"[WARNING] Output file does not exist: {self.last_output_file}")
+                except Exception as e:
+                    self.log(f"[WARNING] Could not read output file: {e}")
             self.log("[INFO] Backend process completed.")
             return
 

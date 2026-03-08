@@ -8,6 +8,7 @@ import signal
 from pathlib import Path
 from datetime import datetime
 import tempfile
+import time
 
 # --- CONFIGURATION ---
 CLIPBOARD_CMD = 'wl-copy' 
@@ -15,7 +16,9 @@ DEBUG_LOG = Path.home() / "ocr_debug.log"
 OUTPUT_FILE = Path.home() / "Pictures" / "ocr" / "ocr_result.txt"
 EDITOR_CMD = 'kwrite'  # The text editor to open
 OLLAMA_TIMEOUT_SECONDS = 180
-MODEL_NAME = "glm-ocr"
+SCREENSHOT_TIMEOUT_SECONDS = 90
+PRIMARY_MODEL_NAME = "glm-ocr"
+FALLBACK_MODEL_NAMES = [m.strip() for m in os.environ.get("OCR_FALLBACK_MODELS", "").split(",") if m.strip()]
 TABLE_STYLE_BLOCK = """<style>
 table {
   width: auto;
@@ -97,10 +100,20 @@ def open_editor(file_path):
         log_error("Editor Error", str(e))
         emit_warning(f"Could not open {EDITOR_CMD}: {e}")
 
+def ensure_directory(path):
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        return True
+    except Exception as e:
+        log_error(f"Directory create failed: {path}", str(e))
+        emit_warning(f"Could not create directory {path}: {e}")
+        return False
+
 def sanitize_image(image_path):
     """
-    Sanitizes image to prevent GGML_ASSERT crashes (fix for text-only PDFs).
-    Ensures RGB format and aligns dimensions to multiples of 28.
+    Sanitizes image to prevent GGML_ASSERT crashes while preserving OCR readability.
+    Keeps dimensions compatible with the model (multiples of 28), avoids over-downscaling
+    for screen text, and writes lossless PNG to reduce text artifacts.
     """
     if not HAS_PILLOW:
         return image_path
@@ -108,13 +121,21 @@ def sanitize_image(image_path):
     try:
         img = Image.open(image_path)
         img = img.convert("RGB")
-        
-        # Max dimension to prevent memory errors
-        max_dim = 1120 
+
+        # Keep higher detail for small UI fonts while still bounding giant captures.
+        max_dim = 2240
+        min_dim_for_text = 900
         w, h = img.size
-        
-        # Calculate scale
-        scale = min(max_dim / w, max_dim / h, 1.0)
+
+        longest = max(w, h)
+        shortest = min(w, h)
+        if longest > max_dim:
+            scale = max_dim / float(longest)
+        elif shortest < min_dim_for_text:
+            scale = min_dim_for_text / float(shortest)
+        else:
+            scale = 1.0
+
         new_w = int(w * scale)
         new_h = int(h * scale)
 
@@ -129,8 +150,8 @@ def sanitize_image(image_path):
         if new_w != w or new_h != h:
             img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
-        safe_path = image_path.with_suffix('.temp.jpg')
-        img.save(safe_path, "JPEG", quality=100)
+        safe_path = image_path.with_suffix('.temp.png')
+        img.save(safe_path, "PNG")
         
         return safe_path
         
@@ -140,13 +161,20 @@ def sanitize_image(image_path):
         return image_path
 
 def _run_capture_command(cmd, filename, backend_name):
+    emit_info(f"Starting screenshot backend: {backend_name}")
     try:
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             encoding="utf-8",
+            timeout=SCREENSHOT_TIMEOUT_SECONDS,
         )
+    except subprocess.TimeoutExpired:
+        msg = f"{backend_name} timed out after {SCREENSHOT_TIMEOUT_SECONDS}s"
+        log_error("Screenshot timeout", msg)
+        emit_warning(msg)
+        return False
     except Exception as e:
         log_error(f"{backend_name} screenshot exception", str(e))
         emit_warning(f"{backend_name} screenshot failed: {e}")
@@ -161,6 +189,13 @@ def _run_capture_command(cmd, filename, backend_name):
                 f"{backend_name} returned {result.returncode}, but screenshot file was created."
             )
         return True
+
+    # Some backends/portals write the output file slightly after process exit.
+    for _ in range(12):
+        time.sleep(0.25)
+        if filename.exists() and filename.stat().st_size > 0:
+            emit_info(f"{backend_name} completed with delayed file write.")
+            return True
 
     if result.returncode != 0:
         details = stderr or stdout or "no stderr/stdout"
@@ -177,6 +212,76 @@ def _run_capture_command(cmd, filename, backend_name):
     emit_warning(f"{backend_name} finished but no screenshot file was created.")
     return False
 
+def _save_wayland_clipboard_image(filename):
+    if not shutil.which("wl-paste"):
+        return False
+    try:
+        result = subprocess.run(
+            ["wl-paste", "--type", "image/png"],
+            capture_output=True,
+            timeout=5,
+        )
+    except Exception as e:
+        log_error("wl-paste clipboard read failed", str(e))
+        emit_warning(f"wl-paste failed: {e}")
+        return False
+
+    if result.returncode != 0 or not result.stdout:
+        return False
+    # PNG signature
+    if not result.stdout.startswith(b"\x89PNG\r\n\x1a\n"):
+        return False
+
+    try:
+        filename.write_bytes(result.stdout)
+        return filename.exists() and filename.stat().st_size > 0
+    except Exception as e:
+        log_error("Failed to write clipboard image", str(e))
+        return False
+
+def _run_grim_slurp(filename):
+    try:
+        emit_info("Starting screenshot backend: grim+slurp")
+        region = subprocess.run(
+            ["slurp"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=SCREENSHOT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        emit_warning(f"slurp timed out after {SCREENSHOT_TIMEOUT_SECONDS}s")
+        return False
+    except Exception as e:
+        emit_warning(f"slurp failed: {e}")
+        return False
+
+    geom = (region.stdout or "").strip()
+    if region.returncode != 0 or not geom:
+        return False
+
+    try:
+        grab = subprocess.run(
+            ["grim", "-g", geom, str(filename)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=SCREENSHOT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        emit_warning(f"grim timed out after {SCREENSHOT_TIMEOUT_SECONDS}s")
+        return False
+    except Exception as e:
+        emit_warning(f"grim failed: {e}")
+        return False
+
+    if grab.returncode != 0:
+        stderr = (grab.stderr or "").strip()
+        if stderr:
+            emit_warning(stderr.splitlines()[-1])
+        return False
+    return filename.exists() and filename.stat().st_size > 0
+
 def take_screenshot():
     tmp = tempfile.NamedTemporaryFile(prefix="ocr_capture_", suffix=".png", delete=False)
     filename = Path(tmp.name)
@@ -184,18 +289,34 @@ def take_screenshot():
 
     try:
         backends = []
+        is_wayland = os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+        has_grim_slurp = is_wayland and shutil.which("grim") and shutil.which("slurp")
 
         if shutil.which("spectacle"):
             backends.append(
-                ("spectacle", ["spectacle", "-r", "-b", "-n", "-o", str(filename)])
+                ("spectacle", ["spectacle", "-r", "-b", "-n", "-o", str(filename)], "file")
             )
             backends.append(
-                ("spectacle (legacy flags)", ["spectacle", "-r", "-b", "-o", str(filename)])
+                ("spectacle (legacy flags)", ["spectacle", "-r", "-b", "-o", str(filename)], "file")
+            )
+            backends.append(
+                ("spectacle (--region --output)", ["spectacle", "--region", "--output", str(filename)], "file")
+            )
+            backends.append(
+                ("spectacle (-r -o)", ["spectacle", "-r", "-o", str(filename)], "file")
+            )
+            backends.append(
+                ("spectacle (clipboard fallback)", ["spectacle", "-r", "-b", "-n", "-c"], "clipboard")
             )
 
         if shutil.which("gnome-screenshot"):
             backends.append(
-                ("gnome-screenshot", ["gnome-screenshot", "-a", "-f", str(filename)])
+                ("gnome-screenshot", ["gnome-screenshot", "-a", "-f", str(filename)], "file")
+            )
+        if shutil.which("import"):
+            # ImageMagick import can work as X11/XWayland fallback.
+            backends.append(
+                ("import", ["import", str(filename)], "file")
             )
 
         if not backends:
@@ -204,13 +325,44 @@ def take_screenshot():
                 os.remove(filename)
             return None
 
-        for backend_name, cmd in backends:
+        if has_grim_slurp:
             if filename.exists():
                 filename.unlink(missing_ok=True)
-            if _run_capture_command(cmd, filename, backend_name):
+            if _run_grim_slurp(filename):
                 return filename
 
-        emit_warning("Screenshot canceled or failed.")
+        for backend_name, cmd, target in backends:
+            if filename.exists():
+                filename.unlink(missing_ok=True)
+            if target == "file" and _run_capture_command(cmd, filename, backend_name):
+                return filename
+            if target == "clipboard":
+                emit_info(f"Starting screenshot backend: {backend_name}")
+                try:
+                    result = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        timeout=SCREENSHOT_TIMEOUT_SECONDS,
+                    )
+                except subprocess.TimeoutExpired:
+                    emit_warning(f"{backend_name} timed out after {SCREENSHOT_TIMEOUT_SECONDS}s")
+                    continue
+                except Exception as e:
+                    emit_warning(f"{backend_name} failed: {e}")
+                    continue
+
+                if result.returncode == 0 and _save_wayland_clipboard_image(filename):
+                    emit_info(f"{backend_name} captured image from clipboard.")
+                    return filename
+                if result.returncode != 0:
+                    stderr = (result.stderr or "").strip()
+                    if stderr:
+                        emit_warning(stderr.splitlines()[-1])
+                emit_warning(f"{backend_name} did not produce a clipboard image.")
+
+        emit_warning("Screenshot canceled, timed out, or failed.")
         if filename.exists():
             os.remove(filename)
         return None
@@ -227,6 +379,14 @@ def get_mode():
         if 'table' in arg: return "Table Recognition"
         if 'figure' in arg: return "Figure Recognition"
     return "Text Recognition"
+
+def build_prompt(mode, image_path):
+    image_path = str(image_path)
+    if mode == "Table Recognition":
+        return f"Extract table content from this image as HTML table: {image_path}"
+    if mode == "Figure Recognition":
+        return f"Extract all visible text from this figure image: {image_path}"
+    return f"Extract all visible text from this image: {image_path}"
 
 def ensure_ollama_daemon():
     """Ensure Ollama daemon is reachable; try starting it once if needed."""
@@ -276,11 +436,11 @@ def ensure_ollama_daemon():
         emit_error(err)
     return False
 
-def check_ollama_model():
+def check_ollama_model(model_name, noisy=True):
     """Fast preflight so we fail clearly before long OCR execution."""
     try:
         result = subprocess.run(
-            ["ollama", "show", MODEL_NAME],
+            ["ollama", "show", model_name],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -288,25 +448,28 @@ def check_ollama_model():
         )
         if result.returncode != 0:
             err = (result.stderr or "").strip()
-            emit_error(f"Model '{MODEL_NAME}' is not ready in Ollama.")
-            if err:
-                emit_error(err)
+            if noisy:
+                emit_error(f"Model '{model_name}' is not ready in Ollama.")
+                if err:
+                    emit_error(err)
             return False
         return True
     except subprocess.TimeoutExpired:
-        emit_error("Timeout while checking model availability in Ollama.")
+        if noisy:
+            emit_error("Timeout while checking model availability in Ollama.")
         return False
     except Exception as e:
-        emit_error(f"Failed to check model availability: {e}")
+        if noisy:
+            emit_error(f"Failed to check model availability: {e}")
         return False
 
-def run_ollama(prompt):
+def run_ollama(model_name, prompt):
     """
     Runs Ollama with a hard timeout so GUI flow cannot hang forever.
     Returns (returncode, stdout, stderr, timed_out).
     """
     process = subprocess.Popen(
-        ["ollama", "run", MODEL_NAME],
+        ["ollama", "run", model_name],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -330,7 +493,7 @@ def run_ollama(prompt):
             stdout, stderr = process.communicate()
         return 124, stdout or "", stderr or "", True
 
-def detect_model_processor():
+def detect_model_processor(model_name):
     """
     Best-effort check for the loaded model processor from `ollama ps`.
     Returns "GPU", "CPU", "UNKNOWN", or None if not available.
@@ -353,7 +516,7 @@ def detect_model_processor():
         stripped = line.strip()
         if not stripped or stripped.lower().startswith("name"):
             continue
-        if MODEL_NAME not in stripped:
+        if model_name not in stripped:
             continue
         upper = stripped.upper()
         if "GPU" in upper:
@@ -363,8 +526,8 @@ def detect_model_processor():
         return "UNKNOWN"
     return None
 
-def emit_processor_diagnostics():
-    processor = detect_model_processor()
+def emit_processor_diagnostics(model_name):
+    processor = detect_model_processor(model_name)
     if processor == "GPU":
         emit_info("Ollama processor: GPU")
         return
@@ -430,19 +593,19 @@ def run():
     emit_info(f"Mode: {mode}")
     
     # 1. Screenshot
+    emit_info("Starting screenshot capture. Select a region and confirm the shot.")
     original_path = take_screenshot()
     if not original_path:
         emit_warning("No screenshot captured. OCR aborted.")
         return 0
 
     emit_info(f"Screenshot captured: {original_path}")
-    emit_info(f"Running {MODEL_NAME}...")
+    emit_info(f"Running {PRIMARY_MODEL_NAME}...")
 
     # 2. Sanitize
     processing_path = sanitize_image(original_path)
 
     # 3. Prompt Ollama
-    prompt = f"{mode}: {processing_path}"
     emit_info(f"Model prompt image: {processing_path}")
     
     try:
@@ -453,38 +616,70 @@ def run():
         if not ensure_ollama_daemon():
             return 2
 
-        if not check_ollama_model():
+        model_candidates = [PRIMARY_MODEL_NAME]
+        for model_name in FALLBACK_MODEL_NAMES:
+            if model_name not in model_candidates:
+                model_candidates.append(model_name)
+
+        ready_models = []
+        for idx, model_name in enumerate(model_candidates):
+            if check_ollama_model(model_name, noisy=(idx == 0)):
+                ready_models.append(model_name)
+
+        if not ready_models:
             return 2
 
         emit_info(f"Waiting for OCR result (timeout: {OLLAMA_TIMEOUT_SECONDS}s)...")
-        return_code, stdout, stderr, timed_out = run_ollama(prompt)
-        emit_processor_diagnostics()
+        prompt = build_prompt(mode, processing_path)
 
+        clean_output = ""
+        last_stdout = ""
+        last_stderr = ""
+        last_return_code = 0
+        last_timed_out = False
 
-        if return_code != 0:
-            err_msg = (stderr or "").strip()
-            log_error(f"Ollama Failed ({return_code})", err_msg)
-            if timed_out:
-                emit_error("Model execution timed out.")
-            else:
-                emit_error("Model failed. Check ~/ocr_debug.log")
-            if err_msg:
-                emit_error(err_msg)
-            return return_code
+        for model_idx, model_name in enumerate(ready_models, start=1):
+            if model_idx > 1:
+                emit_warning(f"Switching OCR model to fallback: {model_name}")
+            emit_processor_diagnostics(model_name)
 
-        # 4. Process Output
-        raw_output = stdout
-        clean_output = normalize_model_output(raw_output)
-        clean_output = apply_table_styling(mode, clean_output)
+            return_code, stdout, stderr, timed_out = run_ollama(model_name, prompt)
+            last_stdout = stdout
+            last_stderr = stderr
+            last_return_code = return_code
+            last_timed_out = timed_out
+
+            if return_code != 0:
+                continue
+
+            candidate = normalize_model_output(stdout)
+            candidate = apply_table_styling(mode, candidate)
+            if not candidate:
+                continue
+            clean_output = candidate
+            break
 
         if not clean_output:
-            log_error("Model returned empty OCR payload", raw_output[:2000])
+            if last_return_code != 0:
+                err_msg = (last_stderr or "").strip()
+                log_error(f"Ollama Failed ({last_return_code})", err_msg)
+                if last_timed_out:
+                    emit_error("Model execution timed out.")
+                else:
+                    emit_error("Model failed. Check ~/ocr_debug.log")
+                if err_msg:
+                    emit_error(err_msg)
+                return last_return_code
+
+            log_error("Model returned empty OCR payload", last_stdout[:2000])
             emit_warning("Model returned no text.")
             emit_warning("Raw model output looked empty (or only markdown fences).")
             return 3
 
         # 5. Save to File
         output_file = OUTPUT_FILE
+        if not ensure_directory(output_file.parent):
+            return 4
         with open(output_file, 'w', encoding='utf-8') as f:
             f.write(clean_output)
         emit_info(f"Saved output file: {output_file}")
