@@ -5,6 +5,8 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
+import threading
 from datetime import datetime
 from pathlib import Path
 import tempfile
@@ -45,6 +47,8 @@ try:
     HAS_PILLOW = True
 except ImportError:
     HAS_PILLOW = False
+
+SNIPPING_TIMEOUT_SECONDS = 30
 
 try:
     import pyperclip
@@ -99,6 +103,17 @@ def open_editor(file_path):
         emit_warning(f"Could not open editor: {e}")
 
 
+def ensure_output_directory():
+    try:
+        OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        return True
+    except Exception as e:
+        log_error("Output Directory Error", str(e))
+        emit_error(f"Could not create output folder: {OUTPUT_FILE.parent}")
+        emit_error(str(e))
+        return False
+
+
 def sanitize_image(image_path):
     if not HAS_PILLOW:
         return image_path
@@ -127,62 +142,61 @@ def sanitize_image(image_path):
         return image_path
 
 
-def select_region():
-    try:
-        import tkinter as tk
-    except Exception as e:
-        emit_error(f"tkinter is required for region selection: {e}")
+def launch_snipping_tool():
+    launch_attempts = [
+        ["snippingtool", "/clip"],
+        ["explorer.exe", "ms-screenclip:"],
+    ]
+
+    for command in launch_attempts:
+        try:
+            subprocess.Popen(command)
+            return True
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            log_error("Snipping Tool Launch Error", f"{command}: {e}")
+
+    return False
+
+
+def get_clipboard_image_signature(clipboard_data):
+    if not hasattr(clipboard_data, "resize"):
         return None
 
-    result = {"bbox": None}
-    root = tk.Tk()
-    root.attributes("-fullscreen", True)
-    root.attributes("-alpha", 0.25)
-    root.attributes("-topmost", True)
-    root.configure(bg="black")
-    root.title("Select OCR Region")
+    try:
+        preview = clipboard_data.convert("RGB").resize((16, 16))
+        return (preview.size, preview.tobytes())
+    except Exception:
+        return None
 
-    canvas = tk.Canvas(root, cursor="cross", bg="black", highlightthickness=0)
-    canvas.pack(fill=tk.BOTH, expand=True)
 
-    state = {"x0": 0, "y0": 0, "rect": None}
+def wait_for_clipboard_image(previous_signature=None, timeout_seconds=SNIPPING_TIMEOUT_SECONDS):
+    deadline = time.monotonic() + timeout_seconds
 
-    def on_press(event):
-        state["x0"], state["y0"] = event.x, event.y
-        if state["rect"]:
-            canvas.delete(state["rect"])
-        state["rect"] = canvas.create_rectangle(
-            state["x0"],
-            state["y0"],
-            state["x0"],
-            state["y0"],
-            outline="red",
-            width=2,
-        )
+    while time.monotonic() < deadline:
+        try:
+            clipboard_data = ImageGrab.grabclipboard()
+        except Exception as e:
+            log_error("Clipboard Capture Error", str(e))
+            emit_error(f"Failed to read clipboard image: {e}")
+            return None
 
-    def on_drag(event):
-        if state["rect"]:
-            canvas.coords(state["rect"], state["x0"], state["y0"], event.x, event.y)
+        if hasattr(clipboard_data, "save"):
+            current_signature = get_clipboard_image_signature(clipboard_data)
+            if previous_signature is not None and current_signature == previous_signature:
+                time.sleep(0.2)
+                continue
 
-    def on_release(event):
-        x1, y1 = event.x, event.y
-        left, right = sorted((state["x0"], x1))
-        top, bottom = sorted((state["y0"], y1))
-        if right - left > 2 and bottom - top > 2:
-            result["bbox"] = (left, top, right, bottom)
-        root.quit()
+            tmp = tempfile.NamedTemporaryFile(prefix="ocr_capture_", suffix=".png", delete=False)
+            filename = Path(tmp.name)
+            tmp.close()
+            clipboard_data.save(filename)
+            return filename
 
-    def on_escape(_event):
-        root.quit()
+        time.sleep(0.2)
 
-    canvas.bind("<ButtonPress-1>", on_press)
-    canvas.bind("<B1-Motion>", on_drag)
-    canvas.bind("<ButtonRelease-1>", on_release)
-    root.bind("<Escape>", on_escape)
-
-    root.mainloop()
-    root.destroy()
-    return result["bbox"]
+    return None
 
 
 def take_screenshot():
@@ -190,24 +204,22 @@ def take_screenshot():
         emit_error("Pillow is required on Windows for screenshot capture.")
         return None
 
-    emit_info("Please select region on screen...")
-    bbox = select_region()
-    if not bbox:
-        emit_warning("Screenshot canceled.")
-        return None
-
+    previous_signature = None
     try:
-        img = ImageGrab.grab()
-        cropped = img.crop(bbox)
-    except Exception as e:
-        log_error("Screenshot Error", str(e))
-        emit_error(f"Failed to capture screenshot: {e}")
+        previous_signature = get_clipboard_image_signature(ImageGrab.grabclipboard())
+    except Exception:
+        previous_signature = None
+
+    emit_info("Opening Snipping Tool. Select a region to continue...")
+    if not launch_snipping_tool():
+        emit_error("Could not start the Windows Snipping Tool.")
         return None
 
-    tmp = tempfile.NamedTemporaryFile(prefix="ocr_capture_", suffix=".png", delete=False)
-    filename = Path(tmp.name)
-    tmp.close()
-    cropped.save(filename)
+    filename = wait_for_clipboard_image(previous_signature=previous_signature)
+    if not filename:
+        emit_warning("No snip was captured from the clipboard.")
+        return None
+
     return filename
 
 def get_mode():
@@ -303,13 +315,25 @@ def run_ollama(prompt):
         text=True,
         encoding="utf-8",
     )
+    stop_event = threading.Event()
+
+    def progress_heartbeat():
+        elapsed_seconds = 0
+        while not stop_event.wait(5):
+            elapsed_seconds += 5
+            emit_info(f"OCR still running... {elapsed_seconds}s elapsed.")
+
+    heartbeat_thread = threading.Thread(target=progress_heartbeat, daemon=True)
+    heartbeat_thread.start()
     try:
         stdout, stderr = process.communicate(
             input=prompt + "\n",
             timeout=OLLAMA_TIMEOUT_SECONDS,
         )
+        stop_event.set()
         return process.returncode, stdout, stderr, False
     except subprocess.TimeoutExpired:
+        stop_event.set()
         emit_error(f"Ollama timed out after {OLLAMA_TIMEOUT_SECONDS}s. Terminating process.")
         try:
             process.send_signal(signal.SIGTERM)
@@ -374,6 +398,7 @@ def run():
             return 2
 
         emit_info(f"Waiting for OCR result (timeout: {OLLAMA_TIMEOUT_SECONDS}s)...")
+        emit_info("The first OCR run can take longer while glm-ocr starts up.")
         return_code, stdout, stderr, timed_out = run_ollama(prompt)
 
 
@@ -394,6 +419,9 @@ def run():
         if not clean_output:
             emit_warning("Model returned no text.")
             return 3
+
+        if not ensure_output_directory():
+            return 4
 
         output_file = OUTPUT_FILE
         with open(output_file, "w", encoding="utf-8") as f:

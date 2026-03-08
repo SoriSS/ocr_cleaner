@@ -20,7 +20,7 @@ It captures a screen region, sends it to `glm-ocr` via Ollama, saves text output
   - Streams backend logs directly into the main log panel.
 - `ocr_only_windows.py`
   - Windows backend pipeline.
-  - Uses a built-in region selector (Tk overlay) + Pillow screen grab.
+  - Uses Windows Snipping Tool and reads the captured image from the clipboard.
   - Uses `pyperclip` for clipboard and `notepad.exe` for opening output.
 
 ## Requirements
@@ -72,7 +72,6 @@ ollama serve
   - `PyQt6`
   - `Pillow`
   - `pyperclip`
-- `tkinter` available (bundled with most standard Python installs)
 - Output files are saved to:
   - `%USERPROFILE%\Pictures\ocr\`
 
@@ -192,4 +191,4 @@ You can rename the shortcut to `GLM OCR` and pin it to Start/Taskbar.
 - Editor not opening:
   - install `kwrite` or change `EDITOR_CMD` in `ocr_only.py`.
 - Windows region selector not opening:
-  - verify `tkinter` is present in your Python installation.
+  - ensure `snippingtool.exe` is available and clipboard access is not blocked.
