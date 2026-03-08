@@ -404,6 +404,27 @@ def apply_table_styling(mode, output_text):
         return styled_output
     return f"{TABLE_STYLE_BLOCK}\n{styled_output}"
 
+def normalize_model_output(raw_output):
+    """
+    Clean common Ollama/glm-ocr wrappers.
+    If output is only a fenced markdown block with no content, returns an empty string.
+    """
+    cleaned = re.sub(r"Added image '.*?'", "", raw_output).strip()
+
+    # Remove a single full fenced block wrapper, optionally tagged as markdown/text/html.
+    fenced_match = re.match(
+        r"^\s*```(?:markdown|md|text|txt|html)?\s*\n?(.*?)\n?```\s*$",
+        cleaned,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if fenced_match:
+        cleaned = fenced_match.group(1).strip()
+
+    # Also remove stray fence markers if the model emitted broken wrappers.
+    cleaned = re.sub(r"^\s*```(?:markdown|md|text|txt|html)?\s*$", "", cleaned, flags=re.IGNORECASE | re.MULTILINE)
+    cleaned = re.sub(r"^\s*```\s*$", "", cleaned, flags=re.MULTILINE)
+    return cleaned.strip()
+
 def run():
     mode = get_mode()
     emit_info(f"Mode: {mode}")
@@ -453,11 +474,13 @@ def run():
 
         # 4. Process Output
         raw_output = stdout
-        clean_output = re.sub(r"Added image '.*?'", "", raw_output).strip()
+        clean_output = normalize_model_output(raw_output)
         clean_output = apply_table_styling(mode, clean_output)
 
         if not clean_output:
+            log_error("Model returned empty OCR payload", raw_output[:2000])
             emit_warning("Model returned no text.")
+            emit_warning("Raw model output looked empty (or only markdown fences).")
             return 3
 
         # 5. Save to File

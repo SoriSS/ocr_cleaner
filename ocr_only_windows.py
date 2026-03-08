@@ -14,7 +14,7 @@ import tempfile
 DEBUG_LOG = Path.home() / "ocr_debug.log"
 OUTPUT_FILE = Path.home() / "Pictures" / "ocr" / "ocr_result.txt"
 EDITOR_CMD = "notepad.exe"
-OLLAMA_TIMEOUT_SECONDS = 180
+OLLAMA_TIMEOUT_SECONDS = 420
 TABLE_STYLE_BLOCK = """<style>
 table {
   width: auto;
@@ -204,16 +204,16 @@ def take_screenshot():
         emit_error("Pillow is required on Windows for screenshot capture.")
         return None
 
+    emit_info("Opening Snipping Tool. Select a region to continue...")
+    if not launch_snipping_tool():
+        emit_error("Could not start the Windows Snipping Tool.")
+        return None
+
     previous_signature = None
     try:
         previous_signature = get_clipboard_image_signature(ImageGrab.grabclipboard())
     except Exception:
         previous_signature = None
-
-    emit_info("Opening Snipping Tool. Select a region to continue...")
-    if not launch_snipping_tool():
-        emit_error("Could not start the Windows Snipping Tool.")
-        return None
 
     filename = wait_for_clipboard_image(previous_signature=previous_signature)
     if not filename:
@@ -306,7 +306,7 @@ def check_ollama_model():
         return False
 
 
-def run_ollama(prompt):
+def run_ollama(prompt, timeout_seconds):
     process = subprocess.Popen(
         ["ollama", "run", "glm-ocr"],
         stdin=subprocess.PIPE,
@@ -328,13 +328,13 @@ def run_ollama(prompt):
     try:
         stdout, stderr = process.communicate(
             input=prompt + "\n",
-            timeout=OLLAMA_TIMEOUT_SECONDS,
+            timeout=timeout_seconds,
         )
         stop_event.set()
         return process.returncode, stdout, stderr, False
     except subprocess.TimeoutExpired:
         stop_event.set()
-        emit_error(f"Ollama timed out after {OLLAMA_TIMEOUT_SECONDS}s. Terminating process.")
+        emit_error(f"Ollama timed out after {timeout_seconds}s. Terminating process.")
         try:
             process.send_signal(signal.SIGTERM)
             stdout, stderr = process.communicate(timeout=5)
@@ -399,7 +399,14 @@ def run():
 
         emit_info(f"Waiting for OCR result (timeout: {OLLAMA_TIMEOUT_SECONDS}s)...")
         emit_info("The first OCR run can take longer while glm-ocr starts up.")
-        return_code, stdout, stderr, timed_out = run_ollama(prompt)
+        return_code, stdout, stderr, timed_out = run_ollama(prompt, OLLAMA_TIMEOUT_SECONDS)
+
+        # First-time model startup can be slow on Windows; retry once automatically.
+        if timed_out:
+            retry_timeout = max(OLLAMA_TIMEOUT_SECONDS, 600)
+            emit_warning("OCR timed out during startup. Retrying once...")
+            emit_info(f"Retrying OCR (timeout: {retry_timeout}s)...")
+            return_code, stdout, stderr, timed_out = run_ollama(prompt, retry_timeout)
 
 
         if return_code != 0:
