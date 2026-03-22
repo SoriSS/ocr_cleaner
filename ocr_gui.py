@@ -3,7 +3,7 @@ import sys
 import shlex
 from pathlib import Path
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QPushButton, 
-                             QLabel, QTextEdit)
+                             QLabel, QTextEdit, QFileDialog)
 from PyQt6.QtCore import Qt, QProcess, QSize
 from PyQt6.QtGui import QIcon, QFont, QColor, QPainter, QPen, QPixmap
 
@@ -56,7 +56,7 @@ class OCRLauncher(QWidget):
     def initUI(self):
         self.setWindowTitle("GLM-OCR Interface")
         self.setWindowIcon(build_app_icon())
-        self.setFixedSize(320, 350) # Slightly taller for the log
+        self.setFixedSize(320, 400) # Slightly taller for the extra PDF action
 
         layout = QVBoxLayout()
         layout.setSpacing(10)
@@ -75,10 +75,12 @@ class OCRLauncher(QWidget):
         self.btn_text = self.create_button("Text Recognition", "draw-text", "text")
         self.btn_table = self.create_button("Table Recognition", "view-grid", "table")
         self.btn_figure = self.create_button("Figure Recognition", "image-x-generic", "figure")
+        self.btn_pdf = self.create_button("PDF OCR", "application-pdf", "pdf")
 
         layout.addWidget(self.btn_text)
         layout.addWidget(self.btn_table)
         layout.addWidget(self.btn_figure)
+        layout.addWidget(self.btn_pdf)
 
         # --- Log Output ---
         lbl_log = QLabel("Status Log:")
@@ -130,9 +132,14 @@ class OCRLauncher(QWidget):
         self.btn_text.setEnabled(enabled)
         self.btn_table.setEnabled(enabled)
         self.btn_figure.setEnabled(enabled)
+        self.btn_pdf.setEnabled(enabled)
 
     def run_ocr(self, mode):
         if not self.script_path:
+            return
+
+        if mode == "pdf":
+            self.run_pdf_ocr()
             return
 
         # 1. Lock UI
@@ -153,6 +160,35 @@ class OCRLauncher(QWidget):
         
         # 3. Start through login shell so GUI gets the same env as terminal
         command = f"python3 -u {shlex.quote(self.script_path)} {shlex.quote(mode)}"
+        self.log(f"[INFO] Launch command: {command}")
+        self.process.start("zsh", ["-lc", command])
+
+    def run_pdf_ocr(self):
+        selected_file, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select PDF file",
+            str(Path.home()),
+            "PDF files (*.pdf)",
+        )
+        if not selected_file:
+            self.log("[INFO] PDF selection canceled.")
+            return
+
+        self.set_buttons_enabled(False)
+        self.no_capture_abort = False
+        self.last_output_file = None
+        self.log("[INFO] Starting PDF OCR...")
+        self.log(f"[INFO] Selected PDF: {selected_file}")
+
+        self.process = QProcess()
+        self.process.readyReadStandardOutput.connect(self.handle_stdout)
+        self.process.readyReadStandardError.connect(self.handle_stderr)
+        self.process.errorOccurred.connect(self.on_process_error)
+        self.process.finished.connect(self.on_process_finished)
+
+        command = (
+            f"python3 -u {shlex.quote(self.script_path)} pdf {shlex.quote(selected_file)}"
+        )
         self.log(f"[INFO] Launch command: {command}")
         self.process.start("zsh", ["-lc", command])
 

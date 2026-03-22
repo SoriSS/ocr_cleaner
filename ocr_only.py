@@ -109,6 +109,51 @@ def ensure_directory(path):
         emit_warning(f"Could not create directory {path}: {e}")
         return False
 
+def parse_cli_args():
+    args = sys.argv[1:]
+    mode = "Text Recognition"
+    pdf_path = None
+    output_path = None
+
+    idx = 0
+    while idx < len(args):
+        arg = args[idx]
+        lowered = arg.lower()
+
+        if lowered in {"text", "table", "figure"}:
+            if lowered == "table":
+                mode = "Table Recognition"
+            elif lowered == "figure":
+                mode = "Figure Recognition"
+            idx += 1
+            continue
+
+        if lowered == "pdf":
+            if idx + 1 >= len(args):
+                emit_error("Missing PDF path after 'pdf'.")
+                return None
+            pdf_path = Path(args[idx + 1]).expanduser()
+            idx += 2
+            continue
+
+        if lowered == "--output":
+            if idx + 1 >= len(args):
+                emit_error("Missing output path after '--output'.")
+                return None
+            output_path = Path(args[idx + 1]).expanduser()
+            idx += 2
+            continue
+
+        if lowered.endswith(".pdf") and pdf_path is None:
+            pdf_path = Path(arg).expanduser()
+            idx += 1
+            continue
+
+        emit_error(f"Unrecognized argument: {arg}")
+        return None
+
+    return mode, pdf_path, output_path
+
 def sanitize_image(image_path):
     """
     Sanitizes image to prevent GGML_ASSERT crashes while preserving OCR readability.
@@ -373,13 +418,6 @@ def take_screenshot():
             os.remove(filename)
         return None
 
-def get_mode():
-    if len(sys.argv) > 1:
-        arg = sys.argv[1].lower()
-        if 'table' in arg: return "Table Recognition"
-        if 'figure' in arg: return "Figure Recognition"
-    return "Text Recognition"
-
 def build_prompt(mode, image_path):
     image_path = str(image_path)
     if mode == "Table Recognition":
@@ -588,9 +626,197 @@ def normalize_model_output(raw_output):
     cleaned = re.sub(r"^\s*```\s*$", "", cleaned, flags=re.MULTILINE)
     return cleaned.strip()
 
+def resolve_ready_models():
+    if not shutil.which("ollama"):
+        emit_error("Missing dependency: ollama")
+        return None
+
+    if not ensure_ollama_daemon():
+        return None
+
+    model_candidates = [PRIMARY_MODEL_NAME]
+    for model_name in FALLBACK_MODEL_NAMES:
+        if model_name not in model_candidates:
+            model_candidates.append(model_name)
+
+    ready_models = []
+    for idx, model_name in enumerate(model_candidates):
+        if check_ollama_model(model_name, noisy=(idx == 0)):
+            ready_models.append(model_name)
+
+    if not ready_models:
+        return None
+    return ready_models
+
+def extract_text_from_image(mode, image_path, ready_models):
+    emit_info(f"Model prompt image: {image_path}")
+    emit_info(f"Waiting for OCR result (timeout: {OLLAMA_TIMEOUT_SECONDS}s)...")
+    prompt = build_prompt(mode, image_path)
+
+    clean_output = ""
+    last_stdout = ""
+    last_stderr = ""
+    last_return_code = 0
+    last_timed_out = False
+
+    for model_idx, model_name in enumerate(ready_models, start=1):
+        if model_idx > 1:
+            emit_warning(f"Switching OCR model to fallback: {model_name}")
+        emit_processor_diagnostics(model_name)
+
+        return_code, stdout, stderr, timed_out = run_ollama(model_name, prompt)
+        last_stdout = stdout
+        last_stderr = stderr
+        last_return_code = return_code
+        last_timed_out = timed_out
+
+        if return_code != 0:
+            continue
+
+        candidate = normalize_model_output(stdout)
+        candidate = apply_table_styling(mode, candidate)
+        if not candidate:
+            continue
+        clean_output = candidate
+        break
+
+    if clean_output:
+        return 0, clean_output
+
+    if last_return_code != 0:
+        err_msg = (last_stderr or "").strip()
+        log_error(f"Ollama Failed ({last_return_code})", err_msg)
+        if last_timed_out:
+            emit_error("Model execution timed out.")
+        else:
+            emit_error("Model failed. Check ~/ocr_debug.log")
+        if err_msg:
+            emit_error(err_msg)
+        return last_return_code, None
+
+    log_error("Model returned empty OCR payload", last_stdout[:2000])
+    emit_warning("Model returned no text.")
+    emit_warning("Raw model output looked empty (or only markdown fences).")
+    return 3, None
+
+def save_output_text(output_text, output_path):
+    if not ensure_directory(output_path.parent):
+        return 4
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(output_text)
+    emit_info(f"Saved output file: {output_path}")
+    return 0
+
+def render_pdf_to_images(pdf_path):
+    if not shutil.which("pdftoppm"):
+        emit_error("Missing dependency: pdftoppm")
+        emit_error("Install poppler-utils to enable PDF OCR.")
+        return None, None
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="ocr_pdf_"))
+    output_prefix = temp_dir / "page"
+    try:
+        result = subprocess.run(
+            ["pdftoppm", "-png", str(pdf_path), str(output_prefix)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=max(OLLAMA_TIMEOUT_SECONDS, 300),
+        )
+    except subprocess.TimeoutExpired:
+        emit_error("PDF rendering timed out.")
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return None, None
+    except Exception as e:
+        log_error("PDF rendering failed", str(e))
+        emit_error(f"Could not render PDF pages: {e}")
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return None, None
+
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout or "").strip()
+        log_error("pdftoppm failed", details)
+        emit_error("Could not render PDF pages.")
+        if details:
+            emit_error(details)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return None, None
+
+    image_paths = sorted(temp_dir.glob("page-*.png"))
+    if not image_paths:
+        emit_error("No pages were rendered from the PDF.")
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return None, None
+
+    return temp_dir, image_paths
+
+def build_pdf_output_path(pdf_path, output_path):
+    if output_path is not None:
+        return output_path
+    return OUTPUT_FILE.with_name(f"{pdf_path.stem}_ocr.txt")
+
+def ocr_pdf_to_text(pdf_path, mode, output_path=None):
+    pdf_path = Path(pdf_path).expanduser()
+    if not pdf_path.exists():
+        emit_error(f"PDF file not found: {pdf_path}")
+        return 2
+    if not pdf_path.is_file():
+        emit_error(f"PDF path is not a file: {pdf_path}")
+        return 2
+
+    emit_info(f"PDF source: {pdf_path}")
+    render_dir, rendered_pages = render_pdf_to_images(pdf_path)
+    if not rendered_pages:
+        return 2
+
+    emit_info(f"Rendered {len(rendered_pages)} page(s) from PDF.")
+    ready_models = resolve_ready_models()
+    if not ready_models:
+        shutil.rmtree(render_dir, ignore_errors=True)
+        return 2
+
+    page_outputs = []
+    try:
+        for page_index, original_path in enumerate(rendered_pages, start=1):
+            emit_info(f"OCR page {page_index}/{len(rendered_pages)}")
+            processing_path = sanitize_image(original_path)
+            try:
+                return_code, clean_output = extract_text_from_image(mode, processing_path, ready_models)
+            finally:
+                try:
+                    if processing_path != original_path and processing_path.exists():
+                        os.remove(processing_path)
+                except Exception:
+                    pass
+
+            if return_code != 0:
+                return return_code
+
+            page_outputs.append(f"===== Page {page_index} =====\n{clean_output}")
+
+        final_output = "\n\n".join(page_outputs)
+        final_output_path = build_pdf_output_path(pdf_path, output_path)
+        save_code = save_output_text(final_output, final_output_path)
+        if save_code != 0:
+            return save_code
+
+        copy_to_clipboard(final_output)
+        open_editor(final_output_path)
+        emit_success(f"{mode} PDF OCR finished successfully.")
+        return 0
+    finally:
+        shutil.rmtree(render_dir, ignore_errors=True)
+
 def run():
-    mode = get_mode()
+    parsed_args = parse_cli_args()
+    if parsed_args is None:
+        return 2
+
+    mode, pdf_path, output_path = parsed_args
     emit_info(f"Mode: {mode}")
+
+    if pdf_path is not None:
+        return ocr_pdf_to_text(pdf_path, mode, output_path)
     
     # 1. Screenshot
     emit_info("Starting screenshot capture. Select a region and confirm the shot.")
@@ -606,83 +832,20 @@ def run():
     processing_path = sanitize_image(original_path)
 
     # 3. Prompt Ollama
-    emit_info(f"Model prompt image: {processing_path}")
-    
     try:
-        if not shutil.which("ollama"):
-            emit_error("Missing dependency: ollama")
-            return 2
-
-        if not ensure_ollama_daemon():
-            return 2
-
-        model_candidates = [PRIMARY_MODEL_NAME]
-        for model_name in FALLBACK_MODEL_NAMES:
-            if model_name not in model_candidates:
-                model_candidates.append(model_name)
-
-        ready_models = []
-        for idx, model_name in enumerate(model_candidates):
-            if check_ollama_model(model_name, noisy=(idx == 0)):
-                ready_models.append(model_name)
-
+        ready_models = resolve_ready_models()
         if not ready_models:
             return 2
 
-        emit_info(f"Waiting for OCR result (timeout: {OLLAMA_TIMEOUT_SECONDS}s)...")
-        prompt = build_prompt(mode, processing_path)
-
-        clean_output = ""
-        last_stdout = ""
-        last_stderr = ""
-        last_return_code = 0
-        last_timed_out = False
-
-        for model_idx, model_name in enumerate(ready_models, start=1):
-            if model_idx > 1:
-                emit_warning(f"Switching OCR model to fallback: {model_name}")
-            emit_processor_diagnostics(model_name)
-
-            return_code, stdout, stderr, timed_out = run_ollama(model_name, prompt)
-            last_stdout = stdout
-            last_stderr = stderr
-            last_return_code = return_code
-            last_timed_out = timed_out
-
-            if return_code != 0:
-                continue
-
-            candidate = normalize_model_output(stdout)
-            candidate = apply_table_styling(mode, candidate)
-            if not candidate:
-                continue
-            clean_output = candidate
-            break
-
-        if not clean_output:
-            if last_return_code != 0:
-                err_msg = (last_stderr or "").strip()
-                log_error(f"Ollama Failed ({last_return_code})", err_msg)
-                if last_timed_out:
-                    emit_error("Model execution timed out.")
-                else:
-                    emit_error("Model failed. Check ~/ocr_debug.log")
-                if err_msg:
-                    emit_error(err_msg)
-                return last_return_code
-
-            log_error("Model returned empty OCR payload", last_stdout[:2000])
-            emit_warning("Model returned no text.")
-            emit_warning("Raw model output looked empty (or only markdown fences).")
-            return 3
+        return_code, clean_output = extract_text_from_image(mode, processing_path, ready_models)
+        if return_code != 0:
+            return return_code
 
         # 5. Save to File
-        output_file = OUTPUT_FILE
-        if not ensure_directory(output_file.parent):
-            return 4
-        with open(output_file, 'w', encoding='utf-8') as f:
-            f.write(clean_output)
-        emit_info(f"Saved output file: {output_file}")
+        output_file = output_path or OUTPUT_FILE
+        save_code = save_output_text(clean_output, output_file)
+        if save_code != 0:
+            return save_code
 
         # 6. Copy to Clipboard
         copy_to_clipboard(clean_output)

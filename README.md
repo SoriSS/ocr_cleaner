@@ -30,6 +30,17 @@ It captures a screen region, sends it to `glm-ocr` via Ollama, saves text output
 - `spectacle` (region screenshot capture)
 - `wl-copy` (Wayland clipboard)
 - `kwrite` (optional; used to open output `.txt`)
+- `pdftoppm` from `poppler-utils` (required for PDF OCR)
+
+Install Linux system dependencies as needed:
+
+```bash
+# Fedora
+sudo dnf install ollama spectacle wl-clipboard kwrite poppler-utils
+
+# Debian / Ubuntu
+sudo apt install ollama spectacle wl-clipboard kwrite poppler-utils
+```
 
 ## Python dependencies
 - Python `3.10+`
@@ -83,6 +94,14 @@ Run GUI:
 python3 ocr_gui.py
 ```
 
+GUI PDF flow:
+
+1. Start `python3 ocr_gui.py`
+2. Click `PDF OCR`
+3. Pick a `.pdf` file in the file chooser
+4. Wait for each page to be rendered and OCR'd
+5. Read the saved output file shown in the log
+
 Run Windows GUI:
 
 ```powershell
@@ -96,6 +115,9 @@ python3 ocr_only.py
 python3 ocr_only.py text
 python3 ocr_only.py table
 python3 ocr_only.py figure
+python3 ocr_only.py pdf /path/to/file.pdf
+python3 ocr_only.py table pdf /path/to/file.pdf
+python3 ocr_only.py pdf /path/to/file.pdf --output /path/to/result.txt
 ```
 
 Run Windows backend directly:
@@ -175,6 +197,50 @@ You can rename the shortcut to `GLM OCR` and pin it to Start/Taskbar.
    - copied to clipboard (if `wl-copy` exists)
    - opened in `kwrite` (if installed)
 
+## PDF OCR
+
+The Linux backend can OCR a PDF file page by page and save the combined result into a text file.
+
+- Default output path: `~/Pictures/ocr/<pdf-name>_ocr.txt`
+- Optional mode selection still works: `text`, `table`, `figure`
+- Each page is separated in the output file with a `===== Page N =====` header
+
+### How to OCR a PDF file
+
+1. Make sure `ollama` is running and `glm-ocr` is installed.
+2. Install `poppler-utils` so `pdftoppm` is available.
+
+```bash
+# Fedora
+sudo dnf install poppler-utils
+
+# Debian / Ubuntu
+sudo apt install poppler-utils
+```
+
+3. Run:
+
+```bash
+python3 ocr_only.py pdf /path/to/file.pdf
+```
+
+4. Wait for each page to be rendered and OCR'd in sequence.
+5. Read the final text file at:
+
+```text
+~/Pictures/ocr/<pdf-name>_ocr.txt
+```
+
+Optional commands:
+
+```bash
+# Force table extraction mode for all pages
+python3 ocr_only.py table pdf /path/to/file.pdf
+
+# Choose a custom output text file
+python3 ocr_only.py pdf /path/to/file.pdf --output /path/to/result.txt
+```
+
 ## Troubleshooting
 
 - Stuck at OCR step:
@@ -186,6 +252,8 @@ You can rename the shortcut to `GLM OCR` and pin it to Start/Taskbar.
   - if still CPU, reinstall/repair your GPU driver stack after the OS update.
 - No screenshot:
   - ensure `spectacle` is installed and region selection is not canceled.
+- PDF OCR fails before OCR starts:
+  - ensure `pdftoppm` is installed (`poppler-utils` on Fedora/Debian-family distros).
 - No clipboard output:
   - ensure `wl-copy` exists.
 - Editor not opening:
