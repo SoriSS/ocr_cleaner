@@ -225,11 +225,29 @@ def take_screenshot():
 def get_mode():
     if len(sys.argv) > 1:
         arg = sys.argv[1].lower()
+        if "handwritten" in arg:
+            return "Handwritten Recognition"
         if "table" in arg:
             return "Table Recognition"
         if "figure" in arg:
             return "Figure Recognition"
     return "Text Recognition"
+
+
+def build_prompt(mode, image_path):
+    image_path = str(image_path)
+    if mode == "Table Recognition":
+        return f"Extract table content from this image as HTML table: {image_path}"
+    if mode == "Figure Recognition":
+        return f"Extract all visible text from this figure image: {image_path}"
+    if mode == "Handwritten Recognition":
+        return (
+            "Extract only handwritten text from this image. "
+            "Ignore printed text, page lines, and other non-handwritten marks. "
+            "Output only the extracted handwritten text: "
+            f"{image_path}"
+        )
+    return f"Extract all visible text from this image: {image_path}"
 
 
 def ensure_ollama_daemon():
@@ -383,7 +401,7 @@ def run():
     emit_info("Running glm-ocr...")
 
     processing_path = sanitize_image(original_path)
-    prompt = f"{mode}: {processing_path}"
+    prompt = build_prompt(mode, processing_path)
     emit_info(f"Model prompt image: {processing_path}")
 
     try:

@@ -56,7 +56,7 @@ class OCRLauncher(QWidget):
     def initUI(self):
         self.setWindowTitle("GLM-OCR Interface")
         self.setWindowIcon(build_app_icon())
-        self.setFixedSize(320, 400) # Slightly taller for the extra PDF action
+        self.setFixedSize(320, 450)
 
         layout = QVBoxLayout()
         layout.setSpacing(10)
@@ -73,11 +73,13 @@ class OCRLauncher(QWidget):
 
         # --- Buttons ---
         self.btn_text = self.create_button("Text Recognition", "draw-text", "text")
+        self.btn_handwritten = self.create_button("OCR Handwritten", "draw-freehand", "handwritten")
         self.btn_table = self.create_button("Table Recognition", "view-grid", "table")
         self.btn_figure = self.create_button("Figure Recognition", "image-x-generic", "figure")
         self.btn_pdf = self.create_button("PDF OCR", "application-pdf", "pdf")
 
         layout.addWidget(self.btn_text)
+        layout.addWidget(self.btn_handwritten)
         layout.addWidget(self.btn_table)
         layout.addWidget(self.btn_figure)
         layout.addWidget(self.btn_pdf)
@@ -130,6 +132,7 @@ class OCRLauncher(QWidget):
 
     def set_buttons_enabled(self, enabled):
         self.btn_text.setEnabled(enabled)
+        self.btn_handwritten.setEnabled(enabled)
         self.btn_table.setEnabled(enabled)
         self.btn_figure.setEnabled(enabled)
         self.btn_pdf.setEnabled(enabled)
