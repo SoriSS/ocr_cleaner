@@ -51,7 +51,7 @@ class OCRLauncherWindows(QWidget):
     def init_ui(self):
         self.setWindowTitle("GLM-OCR Interface (Windows)")
         self.setWindowIcon(build_app_icon())
-        self.setFixedSize(360, 440)
+        self.setFixedSize(360, 390)
 
         layout = QVBoxLayout()
         layout.setSpacing(10)
@@ -66,12 +66,10 @@ class OCRLauncherWindows(QWidget):
         layout.addWidget(title)
 
         self.btn_text = self.create_button("Text Recognition", "text")
-        self.btn_handwritten = self.create_button("OCR Handwritten", "handwritten")
         self.btn_table = self.create_button("Table Recognition", "table")
         self.btn_figure = self.create_button("Figure Recognition", "figure")
         self.btn_pdf = self.create_button("PDF OCR", "pdf")
         layout.addWidget(self.btn_text)
-        layout.addWidget(self.btn_handwritten)
         layout.addWidget(self.btn_table)
         layout.addWidget(self.btn_figure)
         layout.addWidget(self.btn_pdf)
@@ -116,7 +114,6 @@ class OCRLauncherWindows(QWidget):
 
     def set_buttons_enabled(self, enabled):
         self.btn_text.setEnabled(enabled)
-        self.btn_handwritten.setEnabled(enabled)
         self.btn_table.setEnabled(enabled)
         self.btn_figure.setEnabled(enabled)
         self.btn_pdf.setEnabled(enabled)
