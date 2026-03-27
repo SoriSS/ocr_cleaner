@@ -120,13 +120,11 @@ def parse_cli_args():
         arg = args[idx]
         lowered = arg.lower()
 
-        if lowered in {"text", "handwritten", "table", "figure"}:
+        if lowered in {"text", "table", "figure"}:
             if lowered == "table":
                 mode = "Table Recognition"
             elif lowered == "figure":
                 mode = "Figure Recognition"
-            elif lowered == "handwritten":
-                mode = "Handwritten Recognition"
             idx += 1
             continue
 
@@ -426,13 +424,6 @@ def build_prompt(mode, image_path):
         return f"Extract table content from this image as HTML table: {image_path}"
     if mode == "Figure Recognition":
         return f"Extract all visible text from this figure image: {image_path}"
-    if mode == "Handwritten Recognition":
-        return (
-            "Extract only handwritten text from this image. "
-            "Ignore printed text, page lines, and other non-handwritten marks. "
-            "Output only the extracted handwritten text: "
-            f"{image_path}"
-        )
     return f"Extract all visible text from this image: {image_path}"
 
 def ensure_ollama_daemon():
@@ -635,7 +626,7 @@ def normalize_model_output(raw_output):
     cleaned = re.sub(r"^\s*```\s*$", "", cleaned, flags=re.MULTILINE)
     return cleaned.strip()
 
-def resolve_ready_models():
+def resolve_ready_models(mode):
     if not shutil.which("ollama"):
         emit_error("Missing dependency: ollama")
         return None
@@ -706,6 +697,10 @@ def extract_text_from_image(mode, image_path, ready_models):
     log_error("Model returned empty OCR payload", last_stdout[:2000])
     emit_warning("Model returned no text.")
     emit_warning("Raw model output looked empty (or only markdown fences).")
+    if last_stdout.strip():
+        emit_warning(f"Raw stdout: {last_stdout[:500].strip()}")
+    if last_stderr.strip():
+        emit_warning(f"Raw stderr: {last_stderr[:500].strip()}")
     return 3, None
 
 def save_output_text(output_text, output_path):
@@ -779,7 +774,7 @@ def ocr_pdf_to_text(pdf_path, mode, output_path=None):
         return 2
 
     emit_info(f"Rendered {len(rendered_pages)} page(s) from PDF.")
-    ready_models = resolve_ready_models()
+    ready_models = resolve_ready_models(mode)
     if not ready_models:
         shutil.rmtree(render_dir, ignore_errors=True)
         return 2
@@ -842,7 +837,7 @@ def run():
 
     # 3. Prompt Ollama
     try:
-        ready_models = resolve_ready_models()
+        ready_models = resolve_ready_models(mode)
         if not ready_models:
             return 2
 

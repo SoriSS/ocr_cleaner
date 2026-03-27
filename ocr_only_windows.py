@@ -15,6 +15,7 @@ DEBUG_LOG = Path.home() / "ocr_debug.log"
 OUTPUT_FILE = Path.home() / "Pictures" / "ocr" / "ocr_result.txt"
 EDITOR_CMD = "notepad.exe"
 OLLAMA_TIMEOUT_SECONDS = 420
+PRIMARY_MODEL_NAME = "glm-ocr"
 TABLE_STYLE_BLOCK = """<style>
 table {
   width: auto;
@@ -225,8 +226,6 @@ def take_screenshot():
 def get_mode():
     if len(sys.argv) > 1:
         arg = sys.argv[1].lower()
-        if "handwritten" in arg:
-            return "Handwritten Recognition"
         if "table" in arg:
             return "Table Recognition"
         if "figure" in arg:
@@ -240,13 +239,6 @@ def build_prompt(mode, image_path):
         return f"Extract table content from this image as HTML table: {image_path}"
     if mode == "Figure Recognition":
         return f"Extract all visible text from this figure image: {image_path}"
-    if mode == "Handwritten Recognition":
-        return (
-            "Extract only handwritten text from this image. "
-            "Ignore printed text, page lines, and other non-handwritten marks. "
-            "Output only the extracted handwritten text: "
-            f"{image_path}"
-        )
     return f"Extract all visible text from this image: {image_path}"
 
 
@@ -300,10 +292,10 @@ def ensure_ollama_daemon():
     return False
 
 
-def check_ollama_model():
+def check_ollama_model(model_name):
     try:
         result = subprocess.run(
-            ["ollama", "show", "glm-ocr"],
+            ["ollama", "show", model_name],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -311,7 +303,7 @@ def check_ollama_model():
         )
         if result.returncode != 0:
             err = (result.stderr or "").strip()
-            emit_error("Model 'glm-ocr' is not ready in Ollama.")
+            emit_error(f"Model '{model_name}' is not ready in Ollama.")
             if err:
                 emit_error(err)
             return False
@@ -324,9 +316,9 @@ def check_ollama_model():
         return False
 
 
-def run_ollama(prompt, timeout_seconds):
+def run_ollama(model_name, prompt, timeout_seconds):
     process = subprocess.Popen(
-        ["ollama", "run", "glm-ocr"],
+        ["ollama", "run", model_name],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -390,6 +382,7 @@ def apply_table_styling(mode, output_text):
 
 def run():
     mode = get_mode()
+    model_name = PRIMARY_MODEL_NAME
     emit_info(f"Mode: {mode}")
 
     original_path = take_screenshot()
@@ -398,7 +391,7 @@ def run():
         return 1
 
     emit_info(f"Screenshot captured: {original_path}")
-    emit_info("Running glm-ocr...")
+    emit_info(f"Running {model_name}...")
 
     processing_path = sanitize_image(original_path)
     prompt = build_prompt(mode, processing_path)
@@ -412,19 +405,19 @@ def run():
         if not ensure_ollama_daemon():
             return 2
 
-        if not check_ollama_model():
+        if not check_ollama_model(model_name):
             return 2
 
         emit_info(f"Waiting for OCR result (timeout: {OLLAMA_TIMEOUT_SECONDS}s)...")
-        emit_info("The first OCR run can take longer while glm-ocr starts up.")
-        return_code, stdout, stderr, timed_out = run_ollama(prompt, OLLAMA_TIMEOUT_SECONDS)
+        emit_info(f"The first OCR run can take longer while {model_name} starts up.")
+        return_code, stdout, stderr, timed_out = run_ollama(model_name, prompt, OLLAMA_TIMEOUT_SECONDS)
 
         # First-time model startup can be slow on Windows; retry once automatically.
         if timed_out:
             retry_timeout = max(OLLAMA_TIMEOUT_SECONDS, 600)
             emit_warning("OCR timed out during startup. Retrying once...")
             emit_info(f"Retrying OCR (timeout: {retry_timeout}s)...")
-            return_code, stdout, stderr, timed_out = run_ollama(prompt, retry_timeout)
+            return_code, stdout, stderr, timed_out = run_ollama(model_name, prompt, retry_timeout)
 
 
         if return_code != 0:
@@ -442,7 +435,13 @@ def run():
         clean_output = re.sub(r"Added image '.*?'", "", raw_output).strip()
         clean_output = apply_table_styling(mode, clean_output)
         if not clean_output:
+            log_error("Model returned empty OCR payload", (stdout or "")[:2000])
             emit_warning("Model returned no text.")
+            emit_warning("Raw model output looked empty (or only markdown fences).")
+            if (stdout or "").strip():
+                emit_warning(f"Raw stdout: {(stdout or '')[:500].strip()}")
+            if (stderr or "").strip():
+                emit_warning(f"Raw stderr: {(stderr or '')[:500].strip()}")
             return 3
 
         if not ensure_output_directory():
