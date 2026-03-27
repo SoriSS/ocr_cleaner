@@ -4,7 +4,7 @@ import ctypes
 from pathlib import Path
 from PyQt6.QtCore import QSize, QProcess, Qt
 from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap
-from PyQt6.QtWidgets import QApplication, QLabel, QPushButton, QTextEdit, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QApplication, QFileDialog, QLabel, QPushButton, QTextEdit, QVBoxLayout, QWidget
 
 
 def build_app_icon():
@@ -35,6 +35,7 @@ class OCRLauncherWindows(QWidget):
         super().__init__()
         self.script_path = self.find_backend_script()
         self.process = None
+        self.last_output_file = None
         self.init_ui()
 
     def find_backend_script(self):
@@ -68,10 +69,12 @@ class OCRLauncherWindows(QWidget):
         self.btn_handwritten = self.create_button("OCR Handwritten", "handwritten")
         self.btn_table = self.create_button("Table Recognition", "table")
         self.btn_figure = self.create_button("Figure Recognition", "figure")
+        self.btn_pdf = self.create_button("PDF OCR", "pdf")
         layout.addWidget(self.btn_text)
         layout.addWidget(self.btn_handwritten)
         layout.addWidget(self.btn_table)
         layout.addWidget(self.btn_figure)
+        layout.addWidget(self.btn_pdf)
 
         log_label = QLabel("Status Log:")
         log_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
@@ -116,12 +119,18 @@ class OCRLauncherWindows(QWidget):
         self.btn_handwritten.setEnabled(enabled)
         self.btn_table.setEnabled(enabled)
         self.btn_figure.setEnabled(enabled)
+        self.btn_pdf.setEnabled(enabled)
 
     def run_ocr(self, mode):
         if not self.script_path:
             return
 
+        if mode == "pdf":
+            self.run_pdf_ocr()
+            return
+
         self.set_buttons_enabled(False)
+        self.last_output_file = None
         self.log(f"[INFO] Starting {mode}...")
 
         self.process = QProcess()
@@ -132,12 +141,37 @@ class OCRLauncherWindows(QWidget):
 
         self.process.start(sys.executable, ["-u", self.script_path, mode])
 
+    def run_pdf_ocr(self):
+        selected_file, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select PDF file",
+            str(Path.home()),
+            "PDF files (*.pdf)",
+        )
+        if not selected_file:
+            self.log("[INFO] PDF selection canceled.")
+            return
+
+        self.set_buttons_enabled(False)
+        self.last_output_file = None
+        self.log("[INFO] Starting PDF OCR...")
+        self.log(f"[INFO] Selected PDF: {selected_file}")
+
+        self.process = QProcess()
+        self.process.readyReadStandardOutput.connect(self.handle_stdout)
+        self.process.readyReadStandardError.connect(self.handle_stderr)
+        self.process.errorOccurred.connect(self.on_process_error)
+        self.process.finished.connect(self.on_process_finished)
+        self.process.start(sys.executable, ["-u", self.script_path, "pdf", selected_file])
+
     def handle_stdout(self):
         data = self.process.readAllStandardOutput()
         stdout = bytes(data).decode("utf8", errors="replace")
         for line in stdout.splitlines():
             line = line.strip()
             if line:
+                if line.startswith("[INFO] Saved output file: "):
+                    self.last_output_file = line.split(": ", 1)[1].strip()
                 self.log(line)
 
     def handle_stderr(self):
@@ -154,6 +188,21 @@ class OCRLauncherWindows(QWidget):
     def on_process_finished(self, exit_code, exit_status):
         self.set_buttons_enabled(True)
         if exit_code == 0:
+            if self.last_output_file:
+                try:
+                    output_path = Path(self.last_output_file)
+                    if output_path.exists():
+                        content = output_path.read_text(encoding="utf-8")
+                        if content.strip():
+                            preview = content[:1200]
+                            if len(content) > 1200:
+                                preview += "\n..."
+                            self.log("[INFO] OCR preview:")
+                            self.log(preview)
+                        else:
+                            self.log("[WARNING] OCR output file is empty.")
+                except Exception as exc:
+                    self.log(f"[WARNING] Could not preview output file: {exc}")
             self.log("[INFO] Backend process completed.")
             return
 

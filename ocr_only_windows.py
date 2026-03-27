@@ -222,16 +222,52 @@ def take_screenshot():
 
     return filename
 
-def get_mode():
-    if len(sys.argv) > 1:
-        arg = sys.argv[1].lower()
-        if "handwritten" in arg:
-            return "Handwritten Recognition"
-        if "table" in arg:
-            return "Table Recognition"
-        if "figure" in arg:
-            return "Figure Recognition"
-    return "Text Recognition"
+def parse_cli_args():
+    args = sys.argv[1:]
+    mode = "Text Recognition"
+    pdf_path = None
+    output_path = None
+
+    idx = 0
+    while idx < len(args):
+        arg = args[idx]
+        lowered = arg.lower()
+
+        if lowered in {"text", "handwritten", "table", "figure"}:
+            if lowered == "table":
+                mode = "Table Recognition"
+            elif lowered == "figure":
+                mode = "Figure Recognition"
+            elif lowered == "handwritten":
+                mode = "Handwritten Recognition"
+            idx += 1
+            continue
+
+        if lowered == "pdf":
+            if idx + 1 >= len(args):
+                emit_error("Missing PDF path after 'pdf'.")
+                return None
+            pdf_path = Path(args[idx + 1]).expanduser()
+            idx += 2
+            continue
+
+        if lowered == "--output":
+            if idx + 1 >= len(args):
+                emit_error("Missing output path after '--output'.")
+                return None
+            output_path = Path(args[idx + 1]).expanduser()
+            idx += 2
+            continue
+
+        if lowered.endswith(".pdf") and pdf_path is None:
+            pdf_path = Path(arg).expanduser()
+            idx += 1
+            continue
+
+        emit_error(f"Unrecognized argument: {arg}")
+        return None
+
+    return mode, pdf_path, output_path
 
 
 def build_prompt(mode, image_path):
@@ -388,21 +424,244 @@ def apply_table_styling(mode, output_text):
     return f"{TABLE_STYLE_BLOCK}\n{styled_output}"
 
 
+def find_pdftoppm():
+    for command_name in ("pdftoppm.exe", "pdftoppm"):
+        resolved = shutil.which(command_name)
+        if resolved:
+            return resolved
+
+    candidate_paths = [
+        Path(r"C:\Program Files\poppler\Library\bin\pdftoppm.exe"),
+        Path(r"C:\Program Files\poppler\bin\pdftoppm.exe"),
+        Path(r"C:\Program Files (x86)\poppler\Library\bin\pdftoppm.exe"),
+        Path(r"C:\Program Files (x86)\poppler\bin\pdftoppm.exe"),
+        Path.home() / "scoop" / "apps" / "poppler" / "current" / "Library" / "bin" / "pdftoppm.exe",
+        Path.home() / "scoop" / "apps" / "poppler" / "current" / "bin" / "pdftoppm.exe",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Packages",
+    ]
+
+    for path in candidate_paths[:-1]:
+        if path.exists():
+            return str(path)
+
+    winget_root = candidate_paths[-1]
+    if winget_root.exists():
+        for package_dir in sorted(winget_root.glob("*poppler*")):
+            matches = sorted(package_dir.rglob("pdftoppm.exe"))
+            if matches:
+                return str(matches[0])
+
+    return None
+
+
+def save_output_text(output_text, output_path):
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        log_error("Output Directory Error", str(e))
+        emit_error(f"Could not create output folder: {output_path.parent}")
+        emit_error(str(e))
+        return 4
+
+    try:
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(output_text)
+    except Exception as e:
+        log_error("Output File Error", str(e))
+        emit_error(f"Could not write output file: {output_path}")
+        emit_error(str(e))
+        return 4
+
+    emit_info(f"Saved output file: {output_path}")
+    return 0
+
+
+def extract_text_from_image(mode, image_path, timeout_seconds):
+    prompt = build_prompt(mode, image_path)
+    emit_info(f"Model prompt image: {image_path}")
+    emit_info(f"Waiting for OCR result (timeout: {timeout_seconds}s)...")
+    emit_info("The first OCR run can take longer while glm-ocr starts up.")
+    return_code, stdout, stderr, timed_out = run_ollama(prompt, timeout_seconds)
+
+    if timed_out:
+        retry_timeout = max(timeout_seconds, 600)
+        emit_warning("OCR timed out during startup. Retrying once...")
+        emit_info(f"Retrying OCR (timeout: {retry_timeout}s)...")
+        return_code, stdout, stderr, timed_out = run_ollama(prompt, retry_timeout)
+
+    if return_code != 0:
+        err_msg = (stderr or "").strip()
+        log_error(f"Ollama Failed ({return_code})", err_msg)
+        if timed_out:
+            emit_error("Model execution timed out.")
+        else:
+            emit_error("Model failed. Check ~/ocr_debug.log")
+        if err_msg:
+            emit_error(err_msg)
+        return return_code, None
+
+    raw_output = stdout
+    clean_output = re.sub(r"Added image '.*?'", "", raw_output).strip()
+    clean_output = apply_table_styling(mode, clean_output)
+    if not clean_output:
+        emit_warning("Model returned no text.")
+        return 3, None
+
+    return 0, clean_output
+
+
+def render_pdf_to_images(pdf_path):
+    pdftoppm_cmd = find_pdftoppm()
+    if not pdftoppm_cmd:
+        emit_error("Missing dependency: pdftoppm")
+        emit_error("Install Poppler for Windows. Example: winget install oschwartz10612.Poppler or scoop install poppler")
+        emit_error("If Poppler is already installed, ensure pdftoppm.exe is on PATH.")
+        return None, None
+    emit_info(f"Using pdftoppm: {pdftoppm_cmd}")
+    emit_info("Rendering PDF pages to images...")
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="ocr_pdf_"))
+    output_prefix = temp_dir / "page"
+    stderr_lines = []
+    stop_event = threading.Event()
+
+    def read_progress(stream):
+        while not stop_event.is_set():
+            line = stream.readline()
+            if not line:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            stderr_lines.append(line)
+            parts = line.split()
+            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                emit_info(f"Rendered PDF page {parts[0]}/{parts[1]}")
+            else:
+                emit_info(f"pdftoppm: {line}")
+
+    def emit_heartbeat():
+        elapsed_seconds = 0
+        while not stop_event.wait(5):
+            elapsed_seconds += 5
+            emit_info(f"PDF rendering still running... {elapsed_seconds}s elapsed.")
+
+    try:
+        process = subprocess.Popen(
+            [pdftoppm_cmd, "-progress", "-png", str(pdf_path), str(output_prefix)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+        )
+        progress_thread = threading.Thread(target=read_progress, args=(process.stderr,), daemon=True)
+        heartbeat_thread = threading.Thread(target=emit_heartbeat, daemon=True)
+        progress_thread.start()
+        heartbeat_thread.start()
+        try:
+            stdout, _ = process.communicate(timeout=max(OLLAMA_TIMEOUT_SECONDS, 900))
+        finally:
+            stop_event.set()
+        progress_thread.join(timeout=1)
+        heartbeat_thread.join(timeout=1)
+    except subprocess.TimeoutExpired:
+        stop_event.set()
+        try:
+            process.kill()
+            process.communicate(timeout=5)
+        except Exception:
+            pass
+        emit_error("PDF rendering timed out.")
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return None, None
+    except Exception as e:
+        stop_event.set()
+        log_error("PDF rendering failed", str(e))
+        emit_error(f"Could not render PDF pages: {e}")
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return None, None
+
+    if process.returncode != 0:
+        details = ("\n".join(stderr_lines) or (stdout or "")).strip()
+        log_error("pdftoppm failed", details)
+        emit_error("Could not render PDF pages.")
+        if details:
+            emit_error(details)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return None, None
+
+    image_paths = sorted(temp_dir.glob("page-*.png"))
+    if not image_paths:
+        emit_error("No pages were rendered from the PDF.")
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return None, None
+
+    return temp_dir, image_paths
+
+
+def build_pdf_output_path(pdf_path, output_path):
+    if output_path is not None:
+        return output_path
+    return OUTPUT_FILE.with_name(f"{pdf_path.stem}_ocr.txt")
+
+
+def ocr_pdf_to_text(pdf_path, mode, output_path=None):
+    pdf_path = Path(pdf_path).expanduser()
+    if not pdf_path.exists():
+        emit_error(f"PDF file not found: {pdf_path}")
+        return 2
+    if not pdf_path.is_file():
+        emit_error(f"PDF path is not a file: {pdf_path}")
+        return 2
+
+    emit_info(f"PDF source: {pdf_path}")
+    render_dir, rendered_pages = render_pdf_to_images(pdf_path)
+    if not rendered_pages:
+        return 2
+
+    emit_info(f"Rendered {len(rendered_pages)} page(s) from PDF.")
+    page_outputs = []
+    try:
+        for page_index, original_path in enumerate(rendered_pages, start=1):
+            emit_info(f"OCR page {page_index}/{len(rendered_pages)}")
+            processing_path = sanitize_image(original_path)
+            try:
+                return_code, clean_output = extract_text_from_image(
+                    mode, processing_path, OLLAMA_TIMEOUT_SECONDS
+                )
+            finally:
+                try:
+                    if processing_path != original_path and processing_path.exists():
+                        os.remove(processing_path)
+                except Exception:
+                    pass
+
+            if return_code != 0:
+                return return_code
+
+            page_outputs.append(f"===== Page {page_index} =====\n{clean_output}")
+
+        final_output = "\n\n".join(page_outputs)
+        final_output_path = build_pdf_output_path(pdf_path, output_path)
+        save_code = save_output_text(final_output, final_output_path)
+        if save_code != 0:
+            return save_code
+
+        copy_to_clipboard(final_output)
+        open_editor(final_output_path)
+        emit_success(f"{mode} PDF OCR finished successfully.")
+        return 0
+    finally:
+        shutil.rmtree(render_dir, ignore_errors=True)
+
+
 def run():
-    mode = get_mode()
+    parsed_args = parse_cli_args()
+    if parsed_args is None:
+        return 2
+
+    mode, pdf_path, output_path = parsed_args
     emit_info(f"Mode: {mode}")
-
-    original_path = take_screenshot()
-    if not original_path:
-        emit_warning("No screenshot captured. OCR aborted.")
-        return 1
-
-    emit_info(f"Screenshot captured: {original_path}")
-    emit_info("Running glm-ocr...")
-
-    processing_path = sanitize_image(original_path)
-    prompt = build_prompt(mode, processing_path)
-    emit_info(f"Model prompt image: {processing_path}")
 
     try:
         if not shutil.which("ollama"):
@@ -415,43 +674,28 @@ def run():
         if not check_ollama_model():
             return 2
 
-        emit_info(f"Waiting for OCR result (timeout: {OLLAMA_TIMEOUT_SECONDS}s)...")
-        emit_info("The first OCR run can take longer while glm-ocr starts up.")
-        return_code, stdout, stderr, timed_out = run_ollama(prompt, OLLAMA_TIMEOUT_SECONDS)
+        if pdf_path is not None:
+            return ocr_pdf_to_text(pdf_path, mode, output_path)
 
-        # First-time model startup can be slow on Windows; retry once automatically.
-        if timed_out:
-            retry_timeout = max(OLLAMA_TIMEOUT_SECONDS, 600)
-            emit_warning("OCR timed out during startup. Retrying once...")
-            emit_info(f"Retrying OCR (timeout: {retry_timeout}s)...")
-            return_code, stdout, stderr, timed_out = run_ollama(prompt, retry_timeout)
+        original_path = take_screenshot()
+        if not original_path:
+            emit_warning("No screenshot captured. OCR aborted.")
+            return 1
 
+        emit_info(f"Screenshot captured: {original_path}")
+        emit_info("Running glm-ocr...")
 
+        processing_path = sanitize_image(original_path)
+        return_code, clean_output = extract_text_from_image(
+            mode, processing_path, OLLAMA_TIMEOUT_SECONDS
+        )
         if return_code != 0:
-            err_msg = (stderr or "").strip()
-            log_error(f"Ollama Failed ({return_code})", err_msg)
-            if timed_out:
-                emit_error("Model execution timed out.")
-            else:
-                emit_error("Model failed. Check ~/ocr_debug.log")
-            if err_msg:
-                emit_error(err_msg)
             return return_code
 
-        raw_output = stdout
-        clean_output = re.sub(r"Added image '.*?'", "", raw_output).strip()
-        clean_output = apply_table_styling(mode, clean_output)
-        if not clean_output:
-            emit_warning("Model returned no text.")
-            return 3
-
-        if not ensure_output_directory():
-            return 4
-
-        output_file = OUTPUT_FILE
-        with open(output_file, "w", encoding="utf-8") as f:
-            f.write(clean_output)
-        emit_info(f"Saved output file: {output_file}")
+        output_file = output_path or OUTPUT_FILE
+        save_code = save_output_text(clean_output, output_file)
+        if save_code != 0:
+            return save_code
 
         copy_to_clipboard(clean_output)
         open_editor(output_file)
@@ -465,12 +709,12 @@ def run():
         return 99
     finally:
         try:
-            if processing_path != original_path and processing_path.exists():
+            if "processing_path" in locals() and "original_path" in locals() and processing_path != original_path and processing_path.exists():
                 os.remove(processing_path)
         except Exception:
             pass
         try:
-            if original_path.exists():
+            if "original_path" in locals() and original_path.exists():
                 os.remove(original_path)
         except Exception:
             pass

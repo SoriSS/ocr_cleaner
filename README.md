@@ -79,12 +79,23 @@ ollama serve
 
 - Windows 10/11
 - Ollama installed and available in PATH
+- Poppler installed for PDF OCR (`pdftoppm.exe`)
 - Python 3.10+ with:
   - `PyQt6`
   - `Pillow`
   - `pyperclip`
 - Output files are saved to:
   - `%USERPROFILE%\Pictures\ocr\`
+
+Install Windows PDF dependency if you want `PDF OCR` in the GUI or `pdf` mode in the backend:
+
+```powershell
+winget install oschwartz10612.Poppler
+# or
+scoop install poppler
+```
+
+After install, restart your terminal or app launcher so `pdftoppm.exe` is visible to the process.
 
 ## Run
 
@@ -127,7 +138,12 @@ python ocr_only_windows.py
 python ocr_only_windows.py text
 python ocr_only_windows.py table
 python ocr_only_windows.py figure
+python ocr_only_windows.py pdf C:\path\to\file.pdf
+python ocr_only_windows.py table pdf C:\path\to\file.pdf
+python ocr_only_windows.py pdf C:\path\to\file.pdf --output C:\path\to\result.txt
 ```
+
+Windows PDF OCR requires `pdftoppm` from Poppler to be installed and available on `PATH`.
 
 ## Run GUI from an app launcher / shortcut
 
