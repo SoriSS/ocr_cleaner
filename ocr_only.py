@@ -13,7 +13,9 @@ import time
 # --- CONFIGURATION ---
 CLIPBOARD_CMD = 'wl-copy' 
 DEBUG_LOG = Path.home() / "ocr_debug.log"
-OUTPUT_FILE = Path.home() / "Pictures" / "ocr" / "ocr_result.txt"
+OUTPUT_DIR = Path.home() / "Pictures" / "ocr"
+OUTPUT_BASENAME = "ocr_result"
+OUTPUT_SUFFIX = ".txt"
 EDITOR_CMD = 'kwrite'  # The text editor to open
 OLLAMA_TIMEOUT_SECONDS = 180
 SCREENSHOT_TIMEOUT_SECONDS = 90
@@ -108,6 +110,10 @@ def ensure_directory(path):
         log_error(f"Directory create failed: {path}", str(e))
         emit_warning(f"Could not create directory {path}: {e}")
         return False
+
+def build_default_output_path():
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return OUTPUT_DIR / f"{OUTPUT_BASENAME}_{timestamp}{OUTPUT_SUFFIX}"
 
 def parse_cli_args():
     args = sys.argv[1:]
@@ -757,7 +763,7 @@ def render_pdf_to_images(pdf_path):
 def build_pdf_output_path(pdf_path, output_path):
     if output_path is not None:
         return output_path
-    return OUTPUT_FILE.with_name(f"{pdf_path.stem}_ocr.txt")
+    return OUTPUT_DIR / f"{pdf_path.stem}_ocr.txt"
 
 def ocr_pdf_to_text(pdf_path, mode, output_path=None):
     pdf_path = Path(pdf_path).expanduser()
@@ -846,7 +852,7 @@ def run():
             return return_code
 
         # 5. Save to File
-        output_file = output_path or OUTPUT_FILE
+        output_file = output_path or build_default_output_path()
         save_code = save_output_text(clean_output, output_file)
         if save_code != 0:
             return save_code

@@ -12,7 +12,9 @@ from pathlib import Path
 import tempfile
 
 DEBUG_LOG = Path.home() / "ocr_debug.log"
-OUTPUT_FILE = Path.home() / "Pictures" / "ocr" / "ocr_result.txt"
+OUTPUT_DIR = Path.home() / "Pictures" / "ocr"
+OUTPUT_BASENAME = "ocr_result"
+OUTPUT_SUFFIX = ".txt"
 EDITOR_CMD = "notepad.exe"
 OLLAMA_TIMEOUT_SECONDS = 420
 PRIMARY_MODEL_NAME = "glm-ocr"
@@ -106,13 +108,18 @@ def open_editor(file_path):
 
 def ensure_output_directory():
     try:
-        OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         return True
     except Exception as e:
         log_error("Output Directory Error", str(e))
-        emit_error(f"Could not create output folder: {OUTPUT_FILE.parent}")
+        emit_error(f"Could not create output folder: {OUTPUT_DIR}")
         emit_error(str(e))
         return False
+
+
+def build_default_output_path():
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return OUTPUT_DIR / f"{OUTPUT_BASENAME}_{timestamp}{OUTPUT_SUFFIX}"
 
 
 def sanitize_image(image_path):
@@ -596,7 +603,7 @@ def render_pdf_to_images(pdf_path):
 def build_pdf_output_path(pdf_path, output_path):
     if output_path is not None:
         return output_path
-    return OUTPUT_FILE.with_name(f"{pdf_path.stem}_ocr.txt")
+    return OUTPUT_DIR / f"{pdf_path.stem}_ocr.txt"
 
 
 def ocr_pdf_to_text(pdf_path, mode, output_path=None):
@@ -701,7 +708,7 @@ def run():
         if not ensure_output_directory():
             return 4
 
-        output_file = OUTPUT_FILE
+        output_file = build_default_output_path()
         with open(output_file, "w", encoding="utf-8") as f:
             f.write(clean_output)
         emit_info(f"Saved output file: {output_file}")
