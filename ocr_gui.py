@@ -33,6 +33,7 @@ class OCRLauncher(QWidget):
     def __init__(self):
         super().__init__()
         self.script_path = self.find_backend_script()
+        self.script_dir = str(Path(__file__).parent)
         self.process = None # Keep reference to prevent garbage collection
         self.no_capture_abort = False
         self.last_output_file = None
@@ -156,10 +157,11 @@ class OCRLauncher(QWidget):
         self.process.readyReadStandardError.connect(self.handle_stderr)
         self.process.errorOccurred.connect(self.on_process_error)
         self.process.finished.connect(self.on_process_finished)
+        self.process.setWorkingDirectory(self.script_dir)
         
         command_args = ["-u", self.script_path, mode]
-        self.log(f"[INFO] Launch command: python3 {' '.join(command_args)}")
-        self.process.start("python3", command_args)
+        self.log(f"[INFO] Launch command: {sys.executable} {' '.join(command_args)}")
+        self.process.start(sys.executable, command_args)
 
     def run_pdf_ocr(self):
         selected_file, _ = QFileDialog.getOpenFileName(
@@ -183,10 +185,11 @@ class OCRLauncher(QWidget):
         self.process.readyReadStandardError.connect(self.handle_stderr)
         self.process.errorOccurred.connect(self.on_process_error)
         self.process.finished.connect(self.on_process_finished)
+        self.process.setWorkingDirectory(self.script_dir)
 
         command_args = ["-u", self.script_path, "pdf", selected_file]
-        self.log(f"[INFO] Launch command: python3 {' '.join(command_args)}")
-        self.process.start("python3", command_args)
+        self.log(f"[INFO] Launch command: {sys.executable} {' '.join(command_args)}")
+        self.process.start(sys.executable, command_args)
 
     def handle_stdout(self):
         data = self.process.readAllStandardOutput()

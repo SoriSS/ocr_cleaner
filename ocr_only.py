@@ -21,6 +21,7 @@ OLLAMA_TIMEOUT_SECONDS = 180
 SCREENSHOT_TIMEOUT_SECONDS = 90
 PRIMARY_MODEL_NAME = "glm-ocr"
 FALLBACK_MODEL_NAMES = [m.strip() for m in os.environ.get("OCR_FALLBACK_MODELS", "").split(",") if m.strip()]
+OLLAMA_BIN_OVERRIDE = os.environ.get("OLLAMA_BIN", "").strip()
 TABLE_STYLE_BLOCK = """<style>
 table {
   width: auto;
@@ -432,12 +433,45 @@ def build_prompt(mode, image_path):
         return f"Extract all visible text from this figure image: {image_path}"
     return f"Extract all visible text from this image: {image_path}"
 
+def find_ollama_executable():
+    candidates = []
+    if OLLAMA_BIN_OVERRIDE:
+        candidates.append(Path(OLLAMA_BIN_OVERRIDE).expanduser())
+
+    which_result = shutil.which("ollama")
+    if which_result:
+        candidates.append(Path(which_result))
+
+    candidates.extend([
+        Path("/usr/bin/ollama"),
+        Path("/usr/local/bin/ollama"),
+        Path.home() / ".local" / "bin" / "ollama",
+        Path("/var/home") / Path.home().name / ".local" / "bin" / "ollama",
+    ])
+
+    seen = set()
+    for candidate in candidates:
+        candidate = Path(candidate)
+        normalized = str(candidate)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
 def ensure_ollama_daemon():
     """Ensure Ollama daemon is reachable; try starting it once if needed."""
+    ollama_bin = find_ollama_executable()
+    if not ollama_bin:
+        emit_error("Missing dependency: ollama")
+        emit_error("Install Ollama and ensure the binary is on PATH, or set OLLAMA_BIN to its full path.")
+        return False
+
     def can_connect():
         try:
             result = subprocess.run(
-                ["ollama", "ps"],
+                [ollama_bin, "ps"],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -452,25 +486,50 @@ def ensure_ollama_daemon():
         return True
 
     emit_warning("Ollama daemon is not reachable. Trying to start it...")
-    try:
-        subprocess.Popen(
-            ["ollama", "serve"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
+    start_attempts = []
+    if shutil.which("systemctl"):
+        start_attempts.append(
+            (
+                "systemctl --user start ollama",
+                ["systemctl", "--user", "start", "ollama"],
+            )
         )
-    except Exception as e:
-        emit_error(f"Failed to start ollama daemon: {e}")
+    start_attempts.append(
+        (
+            f"{ollama_bin} serve",
+            [ollama_bin, "serve"],
+        )
+    )
+
+    started = False
+    start_errors = []
+    for label, command in start_attempts:
+        try:
+            subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            emit_info(f"Started Ollama using: {label}")
+            started = True
+            break
+        except Exception as e:
+            start_errors.append(f"{label}: {e}")
+
+    if not started:
+        emit_error("Failed to start ollama daemon.")
+        for start_error in start_errors:
+            emit_error(start_error)
         return False
 
-    # Quick retry window
-    for _ in range(10):
+    # Give the daemon enough time to bind, especially after cold start on Fedora.
+    for _ in range(30):
         ok, err = can_connect()
         if ok:
             emit_info("Ollama daemon is now reachable.")
             return True
         try:
-            import time
             time.sleep(0.5)
         except Exception:
             break
@@ -482,9 +541,14 @@ def ensure_ollama_daemon():
 
 def check_ollama_model(model_name, noisy=True):
     """Fast preflight so we fail clearly before long OCR execution."""
+    ollama_bin = find_ollama_executable()
+    if not ollama_bin:
+        if noisy:
+            emit_error("Missing dependency: ollama")
+        return False
     try:
         result = subprocess.run(
-            ["ollama", "show", model_name],
+            [ollama_bin, "show", model_name],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -512,8 +576,11 @@ def run_ollama(model_name, prompt):
     Runs Ollama with a hard timeout so GUI flow cannot hang forever.
     Returns (returncode, stdout, stderr, timed_out).
     """
+    ollama_bin = find_ollama_executable()
+    if not ollama_bin:
+        return 127, "", "ollama executable not found", False
     process = subprocess.Popen(
-        ["ollama", "run", model_name],
+        [ollama_bin, "run", model_name],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -542,9 +609,12 @@ def detect_model_processor(model_name):
     Best-effort check for the loaded model processor from `ollama ps`.
     Returns "GPU", "CPU", "UNKNOWN", or None if not available.
     """
+    ollama_bin = find_ollama_executable()
+    if not ollama_bin:
+        return None
     try:
         result = subprocess.run(
-            ["ollama", "ps"],
+            [ollama_bin, "ps"],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -630,10 +700,50 @@ def normalize_model_output(raw_output):
     # Also remove stray fence markers if the model emitted broken wrappers.
     cleaned = re.sub(r"^\s*```(?:markdown|md|text|txt|html)?\s*$", "", cleaned, flags=re.IGNORECASE | re.MULTILINE)
     cleaned = re.sub(r"^\s*```\s*$", "", cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", cleaned)
+    cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", cleaned)
     return cleaned.strip()
 
+def is_structured_line(line):
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if stripped.startswith(("<", "|", "-", "*", "•", "#", "```")):
+        return True
+    if re.match(r"^\d+[\).\s]", stripped):
+        return True
+    return False
+
+def reflow_plain_text_output(mode, output_text):
+    if mode == "Table Recognition":
+        return output_text
+
+    if "<table" in output_text.lower() or "<div" in output_text.lower() or "<style" in output_text.lower():
+        return output_text
+
+    normalized = output_text.replace("\r\n", "\n").strip()
+    if not normalized:
+        return normalized
+
+    paragraphs = re.split(r"\n\s*\n", normalized)
+    rebuilt = []
+
+    for paragraph in paragraphs:
+        lines = [line.strip() for line in paragraph.splitlines() if line.strip()]
+        if len(lines) <= 1:
+            rebuilt.append(paragraph.strip())
+            continue
+
+        if any(is_structured_line(line) for line in lines):
+            rebuilt.append("\n".join(lines))
+            continue
+
+        rebuilt.append(" ".join(lines))
+
+    return "\n\n".join(part for part in rebuilt if part).strip()
+
 def resolve_ready_models(mode):
-    if not shutil.which("ollama"):
+    if not find_ollama_executable():
         emit_error("Missing dependency: ollama")
         return None
 
@@ -680,6 +790,7 @@ def extract_text_from_image(mode, image_path, ready_models):
             continue
 
         candidate = normalize_model_output(stdout)
+        candidate = reflow_plain_text_output(mode, candidate)
         candidate = apply_table_styling(mode, candidate)
         if not candidate:
             continue

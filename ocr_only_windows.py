@@ -18,6 +18,7 @@ OUTPUT_SUFFIX = ".txt"
 EDITOR_CMD = "notepad.exe"
 OLLAMA_TIMEOUT_SECONDS = 420
 PRIMARY_MODEL_NAME = "glm-ocr"
+FALLBACK_MODEL_NAMES = [m.strip() for m in os.environ.get("OCR_FALLBACK_MODELS", "").split(",") if m.strip()]
 TABLE_STYLE_BLOCK = """<style>
 table {
   width: auto;
@@ -62,11 +63,14 @@ except ImportError:
 
 def log_error(message, error_details=""):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(DEBUG_LOG, "a", encoding="utf-8") as f:
-        f.write(f"[{timestamp}] {message}\n")
-        if error_details:
-            f.write(f"DETAILS:\n{error_details}\n")
-        f.write("-" * 40 + "\n")
+    try:
+        with open(DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{timestamp}] {message}\n")
+            if error_details:
+                f.write(f"DETAILS:\n{error_details}\n")
+            f.write("-" * 40 + "\n")
+    except Exception:
+        pass
 
 
 def emit_info(message):
@@ -361,6 +365,64 @@ def check_ollama_model(model_name):
         return False
 
 
+def normalize_model_output(raw_output):
+    cleaned = re.sub(r"Added image '.*?'", "", raw_output).strip()
+
+    fenced_match = re.match(
+        r"^\s*```(?:markdown|md|text|txt|html)?\s*\n?(.*?)\n?```\s*$",
+        cleaned,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if fenced_match:
+        cleaned = fenced_match.group(1).strip()
+
+    cleaned = re.sub(r"^\s*```(?:markdown|md|text|txt|html)?\s*$", "", cleaned, flags=re.IGNORECASE | re.MULTILINE)
+    cleaned = re.sub(r"^\s*```\s*$", "", cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", cleaned)
+    cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", cleaned)
+    return cleaned.strip()
+
+
+def is_structured_line(line):
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if stripped.startswith(("<", "|", "-", "*", "•", "#", "```")):
+        return True
+    if re.match(r"^\d+[\).\s]", stripped):
+        return True
+    return False
+
+
+def reflow_plain_text_output(mode, output_text):
+    if mode == "Table Recognition":
+        return output_text
+
+    if "<table" in output_text.lower() or "<div" in output_text.lower() or "<style" in output_text.lower():
+        return output_text
+
+    normalized = output_text.replace("\r\n", "\n").strip()
+    if not normalized:
+        return normalized
+
+    paragraphs = re.split(r"\n\s*\n", normalized)
+    rebuilt = []
+
+    for paragraph in paragraphs:
+        lines = [line.strip() for line in paragraph.splitlines() if line.strip()]
+        if len(lines) <= 1:
+            rebuilt.append(paragraph.strip())
+            continue
+
+        if any(is_structured_line(line) for line in lines):
+            rebuilt.append("\n".join(lines))
+            continue
+
+        rebuilt.append(" ".join(lines))
+
+    return "\n\n".join(part for part in rebuilt if part).strip()
+
+
 def run_ollama(model_name, prompt, timeout_seconds):
     process = subprocess.Popen(
         ["ollama", "run", model_name],
@@ -397,6 +459,31 @@ def run_ollama(model_name, prompt, timeout_seconds):
             process.kill()
             stdout, stderr = process.communicate()
         return 124, stdout or "", stderr or "", True
+
+
+def resolve_ready_models():
+    if not shutil.which("ollama"):
+        emit_error("Missing dependency: ollama")
+        return None
+
+    if not ensure_ollama_daemon():
+        return None
+
+    model_candidates = [PRIMARY_MODEL_NAME]
+    for model_name in FALLBACK_MODEL_NAMES:
+        if model_name not in model_candidates:
+            model_candidates.append(model_name)
+
+    ready_models = []
+    for idx, model_name in enumerate(model_candidates):
+        if check_ollama_model(model_name):
+            ready_models.append(model_name)
+        elif idx > 0:
+            emit_warning(f"Fallback model '{model_name}' is not available and will be skipped.")
+
+    if not ready_models:
+        return None
+    return ready_models
 
 
 def apply_table_styling(mode, output_text):
@@ -478,37 +565,56 @@ def save_output_text(output_text, output_path):
 
 
 def extract_text_from_image(mode, image_path, timeout_seconds):
-    prompt = build_prompt(mode, image_path)
     emit_info(f"Model prompt image: {image_path}")
     emit_info(f"Waiting for OCR result (timeout: {timeout_seconds}s)...")
     emit_info("The first OCR run can take longer while glm-ocr starts up.")
-    return_code, stdout, stderr, timed_out = run_ollama(prompt, timeout_seconds)
+    prompt = build_prompt(mode, image_path)
+    ready_models = resolve_ready_models()
+    if not ready_models:
+        return 2, None
 
-    if timed_out:
-        retry_timeout = max(timeout_seconds, 600)
-        emit_warning("OCR timed out during startup. Retrying once...")
-        emit_info(f"Retrying OCR (timeout: {retry_timeout}s)...")
-        return_code, stdout, stderr, timed_out = run_ollama(prompt, retry_timeout)
+    last_return_code = 0
+    last_stderr = ""
+    last_timed_out = False
 
-    if return_code != 0:
-        err_msg = (stderr or "").strip()
-        log_error(f"Ollama Failed ({return_code})", err_msg)
+    for model_idx, model_name in enumerate(ready_models, start=1):
+        if model_idx > 1:
+            emit_warning(f"Retrying OCR with fallback model: {model_name}")
+
+        return_code, stdout, stderr, timed_out = run_ollama(model_name, prompt, timeout_seconds)
+
         if timed_out:
+            retry_timeout = max(timeout_seconds, 600)
+            emit_warning("OCR timed out during startup. Retrying once...")
+            emit_info(f"Retrying OCR (timeout: {retry_timeout}s)...")
+            return_code, stdout, stderr, timed_out = run_ollama(model_name, prompt, retry_timeout)
+
+        last_return_code = return_code
+        last_stderr = stderr or ""
+        last_timed_out = timed_out
+
+        if return_code != 0:
+            continue
+
+        clean_output = normalize_model_output(stdout)
+        clean_output = reflow_plain_text_output(mode, clean_output)
+        clean_output = apply_table_styling(mode, clean_output)
+        if clean_output:
+            return 0, clean_output
+
+    err_msg = last_stderr.strip()
+    if last_return_code != 0:
+        log_error(f"Ollama Failed ({last_return_code})", err_msg)
+        if last_timed_out:
             emit_error("Model execution timed out.")
         else:
             emit_error("Model failed. Check ~/ocr_debug.log")
         if err_msg:
             emit_error(err_msg)
-        return return_code, None
+        return last_return_code, None
 
-    raw_output = stdout
-    clean_output = re.sub(r"Added image '.*?'", "", raw_output).strip()
-    clean_output = apply_table_styling(mode, clean_output)
-    if not clean_output:
-        emit_warning("Model returned no text.")
-        return 3, None
-
-    return 0, clean_output
+    emit_warning("Model returned no text.")
+    return 3, None
 
 
 def render_pdf_to_images(pdf_path):
@@ -657,61 +763,38 @@ def ocr_pdf_to_text(pdf_path, mode, output_path=None):
 
 
 def run():
-    mode = get_mode()
+    parsed_args = parse_cli_args()
+    if parsed_args is None:
+        return 2
+
+    mode, pdf_path, output_path = parsed_args
     emit_info(f"Mode: {mode}")
+
+    if pdf_path is not None:
+        return ocr_pdf_to_text(pdf_path, mode, output_path)
 
     original_path = take_screenshot()
     if not original_path:
         emit_warning("No screenshot captured. OCR aborted.")
-        return 1
+        return 0
 
     emit_info(f"Screenshot captured: {original_path}")
-    emit_info("Running glm-ocr...")
+    emit_info(f"Running {PRIMARY_MODEL_NAME}...")
 
     processing_path = sanitize_image(original_path)
-    prompt = build_prompt(mode, processing_path)
-    emit_info(f"Model prompt image: {processing_path}")
 
     try:
-        if not shutil.which("ollama"):
-            emit_error("Missing dependency: ollama")
-            return 2
-
-        if not ensure_ollama_daemon():
-            return 2
-
-        if not check_ollama_model(model_name):
-            return 2
-
-        emit_info(f"Waiting for OCR result (timeout: {OLLAMA_TIMEOUT_SECONDS}s)...")
-        emit_info("The first OCR run can take longer while glm-ocr starts up.")
-        return_code, stdout, stderr, timed_out = run_ollama(prompt, OLLAMA_TIMEOUT_SECONDS)
-
-        # First-time model startup can be slow on Windows; retry once automatically.
-        if timed_out:
-            retry_timeout = max(OLLAMA_TIMEOUT_SECONDS, 600)
-            emit_warning("OCR timed out during startup. Retrying once...")
-            emit_info(f"Retrying OCR (timeout: {retry_timeout}s)...")
-            return_code, stdout, stderr, timed_out = run_ollama(prompt, retry_timeout)
-
-
+        return_code, clean_output = extract_text_from_image(mode, processing_path, OLLAMA_TIMEOUT_SECONDS)
         if return_code != 0:
             return return_code
-
-        raw_output = stdout
-        clean_output = re.sub(r"Added image '.*?'", "", raw_output).strip()
-        clean_output = apply_table_styling(mode, clean_output)
-        if not clean_output:
-            emit_warning("Model returned no text.")
-            return 3
 
         if not ensure_output_directory():
             return 4
 
-        output_file = build_default_output_path()
-        with open(output_file, "w", encoding="utf-8") as f:
-            f.write(clean_output)
-        emit_info(f"Saved output file: {output_file}")
+        output_file = output_path or build_default_output_path()
+        save_code = save_output_text(clean_output, output_file)
+        if save_code != 0:
+            return save_code
 
         copy_to_clipboard(clean_output)
         open_editor(output_file)

@@ -11,7 +11,7 @@ It captures a screen region, sends it to `glm-ocr` via Ollama, saves text output
 - `ocr_gui.py`
   - Main GUI app.
   - Shows status/errors in the app log panel.
-  - Launches backend through `zsh -lc` so GUI run uses terminal-like environment.
+  - Launches the backend with the current Python interpreter.
 - `ocr_only.py`
   - OCR backend pipeline.
   - Handles screenshot capture, image sanitization (Pillow), Ollama call, output save, clipboard copy, and editor open.
@@ -69,11 +69,12 @@ ollama serve
 ## Environment
 
 - Linux desktop (tested flow assumes Wayland tools like `wl-copy`).
-- `zsh` should be available (GUI uses `zsh -lc` when launching backend).
 - Writes screenshots and OCR output under:
   - `~/Pictures/ocr/`
 - Writes debug log to:
   - `~/ocr_debug.log`
+- Optional for desktop-launcher setups where `ollama` is not on PATH:
+  - set `OLLAMA_BIN=/full/path/to/ollama`
 
 ## Windows environment
 
