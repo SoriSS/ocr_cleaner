@@ -427,11 +427,15 @@ def take_screenshot():
 
 def build_prompt(mode, image_path):
     image_path = str(image_path)
+    cleanup_instruction = (
+        "Transcribe faithfully. Output each visible word once. "
+        "Do not repeat partial word prefixes before the full word."
+    )
     if mode == "Table Recognition":
-        return f"Extract table content from this image as HTML table: {image_path}"
+        return f"Extract table content from this image as an HTML table. {cleanup_instruction}: {image_path}"
     if mode == "Figure Recognition":
-        return f"Extract all visible text from this figure image: {image_path}"
-    return f"Extract all visible text from this image: {image_path}"
+        return f"Extract all visible text from this figure image. {cleanup_instruction}: {image_path}"
+    return f"Extract all visible text from this image. {cleanup_instruction}: {image_path}"
 
 def find_ollama_executable():
     candidates = []
@@ -683,7 +687,7 @@ def apply_table_styling(mode, output_text):
 
 def normalize_model_output(raw_output):
     """
-    Clean common Ollama/glm-ocr wrappers.
+    Clean common Ollama OCR model wrappers.
     If output is only a fenced markdown block with no content, returns an empty string.
     """
     cleaned = re.sub(r"Added image '.*?'", "", raw_output).strip()
@@ -702,7 +706,48 @@ def normalize_model_output(raw_output):
     cleaned = re.sub(r"^\s*```\s*$", "", cleaned, flags=re.MULTILINE)
     cleaned = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", cleaned)
     cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", cleaned)
+    cleaned = remove_ocr_stutter(cleaned)
     return cleaned.strip()
+
+def remove_ocr_stutter(text):
+    """
+    Remove adjacent OCR stutters such as "ra range", "compan companies",
+    and exact duplicate words like "more more".
+    """
+    text = re.sub(r"\b([A-Za-z][A-Za-z'-]{1,})\s+\1\b", r"\1", text, flags=re.IGNORECASE)
+
+    short_word_exceptions = {
+        "a", "all", "an", "and", "are", "as", "at", "be", "but", "by", "can",
+        "do", "for", "from", "go", "had", "has", "he", "her", "his", "how",
+        "i", "if", "in", "is", "it", "man", "may", "me", "my", "new", "no",
+        "not", "now", "of", "on", "or", "our", "out", "she", "so", "that",
+        "the", "them", "then", "they", "this", "to", "up", "us", "was", "we",
+        "who", "will", "with", "you", "your",
+    }
+
+    def replace_prefix_repeat(match):
+        prefix = match.group(1)
+        word = match.group(2)
+        prefix_lower = prefix.lower()
+        word_lower = word.lower()
+
+        if prefix_lower in short_word_exceptions:
+            return match.group(0)
+        if len(prefix) > 10 or len(word) < len(prefix) + 1:
+            return match.group(0)
+        if not word_lower.startswith(prefix_lower):
+            return match.group(0)
+        return word
+
+    prefix_pattern = r"\b([A-Za-z][A-Za-z'-]{0,9})\s+([A-Za-z][A-Za-z'-]{2,})\b"
+    previous = None
+    cleaned = text
+    for _ in range(3):
+        if cleaned == previous:
+            break
+        previous = cleaned
+        cleaned = re.sub(prefix_pattern, replace_prefix_repeat, cleaned)
+    return cleaned
 
 def is_structured_line(line):
     stripped = line.strip()
