@@ -611,7 +611,8 @@ def run_ollama(model_name, prompt):
 def detect_model_processor(model_name):
     """
     Best-effort check for the loaded model processor from `ollama ps`.
-    Returns "GPU", "CPU", "UNKNOWN", or None if not available.
+    Returns "GPU", "CPU", "UNKNOWN", "NOT_LOADED", or None if the command
+    could not be run.
     """
     ollama_bin = find_ollama_executable()
     if not ollama_bin:
@@ -642,7 +643,7 @@ def detect_model_processor(model_name):
         if "CPU" in upper:
             return "CPU"
         return "UNKNOWN"
-    return None
+    return "NOT_LOADED"
 
 def emit_processor_diagnostics(model_name):
     processor = detect_model_processor(model_name)
@@ -657,6 +658,9 @@ def emit_processor_diagnostics(model_name):
         return
     if processor == "UNKNOWN":
         emit_warning("Ollama processor is active but could not be parsed from `ollama ps`.")
+        return
+    if processor == "NOT_LOADED":
+        emit_info("Ollama model is not currently loaded; processor status is not available yet.")
         return
     emit_warning("Could not read `ollama ps` processor status.")
 
@@ -823,9 +827,12 @@ def extract_text_from_image(mode, image_path, ready_models):
     for model_idx, model_name in enumerate(ready_models, start=1):
         if model_idx > 1:
             emit_warning(f"Switching OCR model to fallback: {model_name}")
-        emit_processor_diagnostics(model_name)
 
         return_code, stdout, stderr, timed_out = run_ollama(model_name, prompt)
+        # A fresh Ollama daemon has no model listed in `ollama ps` until the
+        # first request loads it. Check after the request so the processor
+        # column reflects the runner that actually handled this scan.
+        emit_processor_diagnostics(model_name)
         last_stdout = stdout
         last_stderr = stderr
         last_return_code = return_code
