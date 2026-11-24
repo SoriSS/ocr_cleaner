@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 import sys
 from pathlib import Path
-from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QPushButton, 
-                             QLabel, QTextEdit, QFileDialog)
-from PyQt6.QtCore import Qt, QProcess, QSize
-from PyQt6.QtGui import QIcon, QFont, QColor, QPainter, QPen, QPixmap
+try:
+    from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QPushButton,
+                                 QLabel, QTextEdit, QFileDialog)
+    from PyQt6.QtCore import Qt, QProcess, QSize
+    from PyQt6.QtGui import QIcon, QFont, QColor, QPainter, QPen, QPixmap
+except ModuleNotFoundError as exc:
+    if exc.name != "PyQt6":
+        raise
+    from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QPushButton,
+                                 QLabel, QTextEdit, QFileDialog)
+    from PyQt5.QtCore import Qt, QProcess, QSize
+    from PyQt5.QtGui import QIcon, QFont, QColor, QPainter, QPen, QPixmap
 
 
 def build_app_icon():

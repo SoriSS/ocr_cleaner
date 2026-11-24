@@ -220,13 +220,7 @@ def _run_capture_command(cmd, filename, backend_name):
             capture_output=True,
             text=True,
             encoding="utf-8",
-            timeout=SCREENSHOT_TIMEOUT_SECONDS,
         )
-    except subprocess.TimeoutExpired:
-        msg = f"{backend_name} timed out after {SCREENSHOT_TIMEOUT_SECONDS}s"
-        log_error("Screenshot timeout", msg)
-        emit_warning(msg)
-        return False
     except Exception as e:
         log_error(f"{backend_name} screenshot exception", str(e))
         emit_warning(f"{backend_name} screenshot failed: {e}")
@@ -264,33 +258,6 @@ def _run_capture_command(cmd, filename, backend_name):
     emit_warning(f"{backend_name} finished but no screenshot file was created.")
     return False
 
-def _save_wayland_clipboard_image(filename):
-    if not shutil.which("wl-paste"):
-        return False
-    try:
-        result = subprocess.run(
-            ["wl-paste", "--type", "image/png"],
-            capture_output=True,
-            timeout=5,
-        )
-    except Exception as e:
-        log_error("wl-paste clipboard read failed", str(e))
-        emit_warning(f"wl-paste failed: {e}")
-        return False
-
-    if result.returncode != 0 or not result.stdout:
-        return False
-    # PNG signature
-    if not result.stdout.startswith(b"\x89PNG\r\n\x1a\n"):
-        return False
-
-    try:
-        filename.write_bytes(result.stdout)
-        return filename.exists() and filename.stat().st_size > 0
-    except Exception as e:
-        log_error("Failed to write clipboard image", str(e))
-        return False
-
 def _run_grim_slurp(filename):
     try:
         emit_info("Starting screenshot backend: grim+slurp")
@@ -299,11 +266,7 @@ def _run_grim_slurp(filename):
             capture_output=True,
             text=True,
             encoding="utf-8",
-            timeout=SCREENSHOT_TIMEOUT_SECONDS,
         )
-    except subprocess.TimeoutExpired:
-        emit_warning(f"slurp timed out after {SCREENSHOT_TIMEOUT_SECONDS}s")
-        return False
     except Exception as e:
         emit_warning(f"slurp failed: {e}")
         return False
@@ -340,79 +303,30 @@ def take_screenshot():
     tmp.close()
 
     try:
-        backends = []
+        filename.unlink(missing_ok=True)
         is_wayland = os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
         has_grim_slurp = is_wayland and shutil.which("grim") and shutil.which("slurp")
 
+        # Choose an available backend before opening the interactive selector.
+        # An unsuccessful selection must end this request, including cancellation.
         if shutil.which("spectacle"):
-            backends.append(
-                ("spectacle", ["spectacle", "-r", "-b", "-n", "-o", str(filename)], "file")
+            captured = _run_capture_command(
+                ["spectacle", "-r", "-b", "-n", "-o", str(filename)], filename, "spectacle"
             )
-            backends.append(
-                ("spectacle (legacy flags)", ["spectacle", "-r", "-b", "-o", str(filename)], "file")
+        elif has_grim_slurp:
+            captured = _run_grim_slurp(filename)
+        elif shutil.which("gnome-screenshot"):
+            captured = _run_capture_command(
+                ["gnome-screenshot", "-a", "-f", str(filename)], filename, "gnome-screenshot"
             )
-            backends.append(
-                ("spectacle (--region --output)", ["spectacle", "--region", "--output", str(filename)], "file")
-            )
-            backends.append(
-                ("spectacle (-r -o)", ["spectacle", "-r", "-o", str(filename)], "file")
-            )
-            backends.append(
-                ("spectacle (clipboard fallback)", ["spectacle", "-r", "-b", "-n", "-c"], "clipboard")
-            )
-
-        if shutil.which("gnome-screenshot"):
-            backends.append(
-                ("gnome-screenshot", ["gnome-screenshot", "-a", "-f", str(filename)], "file")
-            )
-        if shutil.which("import"):
-            # ImageMagick import can work as X11/XWayland fallback.
-            backends.append(
-                ("import", ["import", str(filename)], "file")
-            )
-
-        if not backends:
+        elif shutil.which("import"):
+            captured = _run_capture_command(["import", str(filename)], filename, "import")
+        else:
             emit_error("Missing screenshot dependency: install spectacle or gnome-screenshot")
-            if filename.exists():
-                os.remove(filename)
             return None
 
-        if has_grim_slurp:
-            if filename.exists():
-                filename.unlink(missing_ok=True)
-            if _run_grim_slurp(filename):
-                return filename
-
-        for backend_name, cmd, target in backends:
-            if filename.exists():
-                filename.unlink(missing_ok=True)
-            if target == "file" and _run_capture_command(cmd, filename, backend_name):
-                return filename
-            if target == "clipboard":
-                emit_info(f"Starting screenshot backend: {backend_name}")
-                try:
-                    result = subprocess.run(
-                        cmd,
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        timeout=SCREENSHOT_TIMEOUT_SECONDS,
-                    )
-                except subprocess.TimeoutExpired:
-                    emit_warning(f"{backend_name} timed out after {SCREENSHOT_TIMEOUT_SECONDS}s")
-                    continue
-                except Exception as e:
-                    emit_warning(f"{backend_name} failed: {e}")
-                    continue
-
-                if result.returncode == 0 and _save_wayland_clipboard_image(filename):
-                    emit_info(f"{backend_name} captured image from clipboard.")
-                    return filename
-                if result.returncode != 0:
-                    stderr = (result.stderr or "").strip()
-                    if stderr:
-                        emit_warning(stderr.splitlines()[-1])
-                emit_warning(f"{backend_name} did not produce a clipboard image.")
+        if captured:
+            return filename
 
         emit_warning("Screenshot canceled, timed out, or failed.")
         if filename.exists():

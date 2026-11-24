@@ -44,7 +44,7 @@ sudo apt install ollama spectacle wl-clipboard kwrite poppler-utils
 
 ## Python dependencies
 - Python `3.10+`
-- `PyQt6`
+- `PyQt6` (Linux GUI also supports `PyQt5` 5.15)
 - `Pillow` (recommended; script works without it, but sanitization is disabled)
 - `pyperclip` (required for clipboard on Windows backend)
 
